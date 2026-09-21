@@ -1,0 +1,8 @@
+﻿veryfl_env/
+build/
+log/
+data/
+__pycache__/
+*.pyc
+node_modules/
+.brownie/
