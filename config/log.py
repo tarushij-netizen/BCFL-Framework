@@ -21,6 +21,7 @@ def get_file_name():
     
 
 def set_log_config():
+    os.makedirs(log_folder, exist_ok=True)
     logging.basicConfig(filename = get_file_name(), 
                         encoding = encoding, 
                         level = level,

@@ -1,6 +1,10 @@
+import csv
 import logging
+import os
+from copy import deepcopy
 logger = logging.getLogger(__name__)
 
+import torch
 from torch.utils.data import DataLoader
 
 from config.algorithm import Algorithm
@@ -54,9 +58,16 @@ class Task:
                     , chain_proxy.get_client_num(), "True" if self.global_args['non-iid'] else "False")
         batch_size = self.global_args.get('batch_size')
         batch_size = 8 if (batch_size is None) else batch_size
-        self.train_dataloader_list = DatasetSpliter().random_split(dataset     = self.train_dataset,
-                                                                   client_list = chain_proxy.get_client_list(),
-                                                                   batch_size  = batch_size)
+        if self.global_args.get('non-iid'):
+            # Dirichlet split: smaller alpha = more skewed client data
+            self.train_dataloader_list = DatasetSpliter().dirichlet_split(dataset     = self.train_dataset,
+                                                                          client_list = chain_proxy.get_client_list(),
+                                                                          batch_size  = batch_size,
+                                                                          alpha       = self.global_args.get('alpha', 1))
+        else:
+            self.train_dataloader_list = DatasetSpliter().random_split(dataset     = self.train_dataset,
+                                                                       client_list = chain_proxy.get_client_list(),
+                                                                       batch_size  = batch_size)
         self.test_dataloader = DataLoader(dataset=self.test_dataset, batch_size=batch_size, shuffle=True)
     
     def _construct_sign(self):
@@ -100,18 +111,71 @@ class Task:
                                     self.trainer, self.train_args, self.test_dataloader, self.keys_dict[client_id])
             self.client_pool.append(new_client)
     
+    def _evaluate_global(self, global_model) -> dict:
+        """Accuracy/loss of the AGGREGATED global model on the full test set."""
+        device = self.train_args.get('device', 'cpu')
+        if self._eval_model is None:
+            self._eval_model = deepcopy(self.client_pool[0].model)
+        model = self._eval_model
+        model.load_state_dict(global_model)
+        model.to(device)
+        model.eval()
+        correct, total, loss_sum = 0, 0, 0.0
+        with torch.no_grad():
+            for data, targets in self.test_dataloader:
+                data, targets = data.to(device), targets.to(device)
+                out = model(data)
+                loss_sum += torch.nn.functional.cross_entropy(out, targets, reduction='sum').item()
+                correct += (out.argmax(1) == targets).sum().item()
+                total += targets.size(0)
+        return {'acc': 100.0 * correct / total, 'loss': loss_sum / total}
+
     def run(self):
         self._regist_client()
         self._construct_dataloader()
         self._construct_sign()
         self._construct_client()
-        
+
+        # Give the server the initial global model (needed by the attack
+        # simulation and by similarityAggregator). Plain fedavgAggregator has no
+        # such method, so the original baseline is unaffected.
+        if hasattr(self.server, 'set_global_model'):
+            self.server.set_global_model(self.client_pool[0].get_model_state_dict())
+
+        self._eval_model = None
+        malicious = set(getattr(self.server, 'malicious', []))
+        results_path = self.global_args.get('results_csv')
+        writer = None
+        if results_path:
+            os.makedirs(os.path.dirname(results_path) or '.', exist_ok=True)
+            f = open(results_path, 'w', newline='')
+            writer = csv.writer(f)
+            writer.writerow(['round', 'global_acc', 'global_loss', 'rejected',
+                             'malicious_caught', 'honest_rejected'])
+        client_test = self.global_args.get('client_test', True)
+
         for i in range(self.global_args['communication_round']):
             for client in self.client_pool:
                 client.train(epoch = i)
-                client.test(epoch = i)
+                if client_test:
+                    client.test(epoch = i)
                 client.sign_test(epoch = i)
             self.server.receive_upload(self.client_pool)
             global_model = self.server.aggregate()
             for client in self.client_pool:
                 client.load_state_dict(global_model)
+
+            res = self._evaluate_global(global_model)
+            rejected = list(getattr(self.server, 'rejected_last_round', []))
+            caught = len([r for r in rejected if r in malicious])
+            honest_rej = len([r for r in rejected if r not in malicious])
+            logger.info(f"Global round {i}: test acc {res['acc']:.2f}, loss {res['loss']:.4f}, "
+                        f"rejected {rejected}, malicious caught {caught}/{len(malicious)}, honest rejected {honest_rej}")
+            print(f"round {i:3d} | global test acc {res['acc']:6.2f}% | loss {res['loss']:.4f} | "
+                  f"rejected {rejected}", flush=True)
+            if writer:
+                writer.writerow([i, f"{res['acc']:.4f}", f"{res['loss']:.6f}",
+                                 ' '.join(map(str, rejected)), caught, honest_rej])
+                f.flush()
+        if writer:
+            f.close()

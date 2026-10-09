@@ -1,95 +1,221 @@
 """
-Standalone sanity test for similarityAggregator -- no PyTorch, no blockchain,
-just numpy dicts shaped like a model state_dict, so this runs instantly.
+Standalone checks for similarityAgg.py (v2) and robustAgg.py.
+No blockchain needed; torch is optional (the torch checks are skipped without it).
 
-Simulates:
-  - 8 "honest" clients: small random perturbations of a shared true direction
-  - 2 "malicious" clients: random noise, uncorrelated with the true direction
-        (simulating a poisoning/free-rider attack)
-
-Success criteria:
-  1. Both malicious clients get REJECTED (their index printed as rejected)
-  2. The final aggregated model is close to the honest clients' average,
-     NOT pulled toward the malicious clients' noise
+Run from the repo root:   python3 test_similarity_agg.py
 """
-import numpy as np
+import os
 import sys
 import types
-import importlib.util
+import importlib
 
-# Stub out the real package chain (which transitively imports torch) so this
-# test can run standalone. This does NOT change similarityAgg.py's real code
-# -- it only provides a minimal stand-in for its one dependency, ServerAggregator,
-# so the actual aggregator logic below is exactly what's in the real file.
-fake_base_pkg = types.ModuleType("server.base.baseAggregator")
+import numpy as np
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# --- stub ServerAggregator so importing does not pull in torch/brownie -------
+for name, path in [("server", "server"), ("server.base", "server/base"),
+                   ("server.aggregation_alg", "server/aggregation_alg")]:
+    pkg = types.ModuleType(name)
+    pkg.__path__ = [os.path.join(ROOT, path)]
+    sys.modules[name] = pkg
+
+base_mod = types.ModuleType("server.base.baseAggregator")
+
 
 class ServerAggregator:
     def __init__(self, model=None, args=None):
-        self.model = model
-        self.id = 0
-        self.args = args
-        self.model_pool = []
+        self.model, self.id, self.args, self.model_pool = model, 0, args, []
 
-fake_base_pkg.ServerAggregator = ServerAggregator
-sys.modules["server"] = types.ModuleType("server")
-sys.modules["server.base"] = types.ModuleType("server.base")
-sys.modules["server.base.baseAggregator"] = fake_base_pkg
-sys.modules["server.aggregation_alg"] = types.ModuleType("server.aggregation_alg")
+    def receive_upload(self, client_pool):
+        for c in client_pool:
+            self.model_pool.append(c.get_model_state_dict())
 
-spec = importlib.util.spec_from_file_location(
-    "server.aggregation_alg.similarityAgg", "server/aggregation_alg/similarityAgg.py"
-)
-similarityAgg_module = importlib.util.module_from_spec(spec)
-sys.modules["server.aggregation_alg.similarityAgg"] = similarityAgg_module
-spec.loader.exec_module(similarityAgg_module)
-similarityAggregator = similarityAgg_module.similarityAggregator
+    def aggregate(self, raw=None):
+        return self._aggregate_alg(self.model_pool if raw is None else raw)
 
-np.random.seed(42)
 
-# A "true" direction that honest clients are all roughly aligned with,
-# shaped like a tiny 2-layer model's state_dict.
-true_layer1 = np.random.randn(20)
-true_layer2 = np.random.randn(10)
-reference_model = {"layer1.weight": true_layer1, "layer2.weight": true_layer2}
+base_mod.ServerAggregator = ServerAggregator
+sys.modules["server.base.baseAggregator"] = base_mod
 
-client_models = []
-labels = []
+sa = importlib.import_module("server.aggregation_alg.similarityAgg")
+ra = importlib.import_module("server.aggregation_alg.robustAgg")
 
-# 8 honest clients: same direction as reference + small noise
-for i in range(8):
-    client_models.append({
-        "layer1.weight": true_layer1 + np.random.normal(0, 0.05, size=20),
-        "layer2.weight": true_layer2 + np.random.normal(0, 0.05, size=10),
-    })
-    labels.append("honest")
+try:
+    import torch
+    HAVE_TORCH = True
+except ImportError:
+    HAVE_TORCH = False
 
-# 2 malicious clients: pure random noise, uncorrelated with true direction
+# --- toy setup ---------------------------------------------------------------
+D1, D2 = 300, 100
+D = D1 + D2
+N = 10
+rng = np.random.default_rng(0)
+signal = rng.standard_normal(D)
+signal /= np.linalg.norm(signal)
+
+
+def make_dict(vec, cls=np.asarray):
+    return {"layer1": cls(vec[:D1].copy()), "layer2": cls(vec[D1:].copy())}
+
+
+def flat(d):
+    return np.concatenate([np.asarray(d["layer1"]).ravel(), np.asarray(d["layer2"]).ravel()])
+
+
+prev_vec = rng.standard_normal(D)
+prev = make_dict(prev_vec)
+
+
+def honest_models(n, seed):
+    r = np.random.default_rng(seed)
+    return [make_dict(prev_vec + signal + r.standard_normal(D) / np.sqrt(D)) for _ in range(n)]
+
+
+class FakeClient:
+    def __init__(self, sd):
+        self.sd = sd
+
+    def get_model_state_dict(self):
+        return self.sd
+
+
+passed, total = 0, 0
+
+
+def check(name, cond, extra=""):
+    global passed, total
+    total += 1
+    passed += bool(cond)
+    print(f"[{'PASS' if cond else 'FAIL'}] {name} {extra}")
+
+
+def screened(models, **kw):
+    agg = sa.similarityAggregator(**kw)
+    agg.set_global_model(prev)
+    agg.round = 1  # skip warm-up
+    out = agg.aggregate(models)
+    return agg, out
+
+
+# 1-2: attackers rejected, result == honest mean
+for attack in ["signflip", "noise"]:
+    honest = honest_models(N, 1)
+    models = list(honest)
+    r = np.random.default_rng(5)
+    for i in range(2):
+        models[i] = sa.poison_state_dict(honest[i], prev, attack, 5.0, r)
+    agg, out = screened(models)
+    honest_mean = np.mean([flat(m) for m in honest[2:]], axis=0)
+    plain_mean = np.mean([flat(m) for m in models], axis=0)
+    err = np.linalg.norm(flat(out) - honest_mean)
+    check(f"{attack}: attackers 0,1 rejected and nobody else", agg.rejected_last_round == [0, 1],
+          f"rejected={agg.rejected_last_round} cos={np.round(agg.last_similarities[:2], 3).tolist()} "
+          f"ratio={np.round(agg.last_norm_ratios[:2], 2).tolist()}")
+    check(f"{attack}: result equals honest mean", err < 1e-9,
+          f"(plain FedAvg off by {np.linalg.norm(plain_mean - honest_mean):.3f})")
+
+# 3: freerider rejected (zero update -> cosine 0)
+honest = honest_models(N, 2)
+models = list(honest)
+models[0] = sa.poison_state_dict(honest[0], prev, "freerider")
+agg, _ = screened(models)
+check("freerider: client 0 rejected", agg.rejected_last_round == [0], f"rejected={agg.rejected_last_round}")
+
+# 4: no false rejections without attackers
+agg, _ = screened(honest_models(N, 3))
+check("no attackers: nobody rejected", agg.rejected_last_round == [],
+      f"min cos={min(agg.last_similarities):.3f}")
+
+# 5: all rejected -> previous model kept
+agg, out = screened(honest_models(N, 4), similarity_threshold=0.999)
+check("all rejected keeps previous model", np.allclose(flat(out), prev_vec))
+
+# 6: optional warm-up = plain average
+agg = sa.similarityAggregator(warmup_rounds=1)
+ms = honest_models(N, 5)
+out = agg.aggregate(ms)
+check("warm-up round is plain average", np.allclose(flat(out), np.mean([flat(m) for m in ms], axis=0)))
+
+# 7-8: pool reset per round and copies
+agg = sa.similarityAggregator()
+clients = [FakeClient(m) for m in honest_models(N, 6)]
+agg.receive_upload(clients)
+agg.receive_upload(clients)
+check("pool reset each round", len(agg.model_pool) == N, f"len={len(agg.model_pool)}")
+clients[0].sd["layer1"][0] += 100.0
+check("pool entries are copies", agg.model_pool[0]["layer1"][0] != clients[0].sd["layer1"][0])
+
+# 9: median aggregator is coordinate-wise median, robust to signflip
+honest = honest_models(N, 7)
+models = list(honest)
 for i in range(2):
-    client_models.append({
-        "layer1.weight": np.random.randn(20) * 3,
-        "layer2.weight": np.random.randn(10) * 3,
-    })
-    labels.append("malicious")
+    models[i] = sa.poison_state_dict(honest[i], prev, "signflip", 5.0)
+med = ra.medianTorchAggregator()
+out = med.aggregate(models)
+check("median aggregator = coordinate-wise median",
+      np.allclose(flat(out), np.median([flat(m) for m in models], axis=0)))
 
-print("Client setup:")
-for idx, label in enumerate(labels):
-    print(f"  Client {idx}: {label}")
-print()
+# 10: krum never picks an attacker
+kr = ra.krumTorchAggregator(num_byzantine=2)
+kr.aggregate(models)
+check("krum picks an honest client", set(kr.rejected_last_round) >= {0, 1})
 
-agg = similarityAggregator(similarity_threshold=0.5, init_model=reference_model)
-result = agg._aggregate_alg(client_models)
+# 11-12: attack wrapper poisons only the malicious indices and tracks the global model
+Server = ra.make_server_class("similarity", "signflip", malicious=[0, 1], seed=0)
+srv = Server()
+srv.set_global_model(prev)
+srv.round = 1
+honest = honest_models(N, 8)
+srv.receive_upload([FakeClient(m) for m in honest])
+poisoned_ok = all(not np.allclose(flat(srv.model_pool[i]), flat(honest[i])) for i in [0, 1])
+untouched_ok = all(np.allclose(flat(srv.model_pool[i]), flat(honest[i])) for i in range(2, N))
+check("wrapper poisons exactly clients 0,1", poisoned_ok and untouched_ok)
+out = srv.aggregate()
+check("wrapper: similarity rejects the poisoned clients; prev global updated",
+      srv.rejected_last_round == [0, 1] and np.allclose(flat(srv._prev_global), flat(out)))
 
-print()
-print("Rejected client indices:", agg.rejected_last_round)
-print("Expected malicious indices: [8, 9]")
-rejected_correctly = set(agg.rejected_last_round) == {8, 9}
-print("PASS -- exactly the malicious clients were rejected" if rejected_correctly
-      else "FAIL -- rejection did not match expected malicious clients")
+# 13: FedAvg under the same attack is pulled away (shows the attack is real)
+Fed = ra.make_server_class("fedavg", "signflip", malicious=[0, 1], seed=0)
+fed = Fed()
+fed.set_global_model(prev)
+fed.receive_upload([FakeClient(m) for m in honest])
+fout = fed.aggregate()
+hm = np.mean([flat(m) for m in honest], axis=0)
+check("fedavg under signflip deviates from honest mean", np.linalg.norm(flat(fout) - hm) > 0.5,
+      f"(off by {np.linalg.norm(flat(fout) - hm):.3f})")
 
-# Check the aggregated result is close to the honest-only average,
-# not pulled toward the malicious noise.
-honest_only_avg_l1 = np.mean([client_models[i]["layer1.weight"] for i in range(8)], axis=0)
-diff_from_honest_avg = np.linalg.norm(result["layer1.weight"] - honest_only_avg_l1)
-print(f"\nDistance between aggregated result and honest-only average: {diff_from_honest_avg:.6f}")
-print("PASS -- aggregated result matches honest-only average closely" if diff_from_honest_avg < 0.1
-      else "FAIL -- aggregated result diverges from honest average (malicious clients may have leaked in)")
+# 14: default settings screen from round 0 (no unscreened warm-up round)
+Server0 = ra.make_server_class("similarity", "signflip", malicious=[0, 1], seed=0)
+s0 = Server0()
+s0.set_global_model(prev)
+s0.receive_upload([FakeClient(m) for m in honest])
+s0.aggregate()
+check("default: attackers rejected already in round 0", s0.rejected_last_round == [0, 1],
+      f"rejected={s0.rejected_last_round}")
+
+# --- torch checks -------------------------------------------------------------
+if HAVE_TORCH:
+    tprev = {k: torch.tensor(v, dtype=torch.float32) for k, v in prev.items()}
+    tm = [{k: torch.tensor(v, dtype=torch.float32) for k, v in m.items()} for m in honest_models(N, 9)]
+    for m in tm:
+        m["bn.num_batches_tracked"] = torch.tensor(7)
+    tprev["bn.num_batches_tracked"] = torch.tensor(7)
+    tp = sa.poison_state_dict(tm[0], tprev, "noise", 5.0)
+    check("torch: poison returns tensors", all(torch.is_tensor(v) for v in tp.values()))
+    agg = sa.similarityAggregator()
+    agg.set_global_model(tprev)
+    agg.round = 1
+    out = agg.aggregate([tp] + tm[1:])
+    check("torch: dtype kept, int buffer kept, attacker rejected",
+          out["layer1"].dtype == torch.float32 and out["bn.num_batches_tracked"].item() == 7
+          and agg.rejected_last_round == [0])
+    med = ra.medianTorchAggregator().aggregate(tm)
+    check("torch: median returns tensors of right shape",
+          torch.is_tensor(med["layer1"]) and med["layer1"].shape == tm[0]["layer1"].shape)
+else:
+    print("(torch not installed: 3 torch checks skipped)")
+
+print(f"\n{passed}/{total} checks passed")
+sys.exit(0 if passed == total else 1)

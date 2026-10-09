@@ -49,8 +49,22 @@ class FedIPR(Algorithm):
         
         
 
+from server.aggregation_alg.robustAgg import make_server_class
+class RobustFL(Algorithm):
+    """FedAvg-style training with a chosen aggregator and optional simulated attackers.
+    aggregator: fedavg | similarity | median | krum
+    attack:     none | signflip | noise | freerider
+    malicious:  0-based client indices whose uploads are poisoned
+    """
+    def __init__(self, aggregator="similarity", attack="none", malicious=(),
+                 attack_scale=5.0, seed=0, agg_kwargs=None):
+        server = make_server_class(aggregator, attack, malicious, attack_scale, seed, agg_kwargs)
+        super(RobustFL, self).__init__(server=server)
+
+
 __all__ = [
     "FedAvg",
     "FedProx",
-    "FedIPR",   
+    "FedIPR",
+    "RobustFL",
 ]
