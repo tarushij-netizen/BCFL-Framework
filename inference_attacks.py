@@ -10,6 +10,10 @@ Attack 1  Gradient inversion ("Inverting Gradients", Geiping et al. 2020, cosine
           reconstruction per original image (higher = more leak; roughly >18 dB is recognisable).
           Also saves results/inversion_grid.png (row 1 = originals, then one row per sigma).
 
+Attack 3  (C1) Gradient inversion when the attacker sees only a k-dimensional CountSketch
+          of the update, as the server does in sketchSecAgg. Saves results/sketch_leakage.csv
+          and results/sketch_inversion_grid.png. Compare with attack 1 at sigma 0 (plaintext).
+
 Attack 2  Membership inference (loss threshold, Yeom et al. 2018). A client trains on a small
           shard (members); the attacker gets the released model and guesses "member" when the
           loss on a sample is low. Metric: AUC (0.5 = no leak, 1.0 = full leak) plus the
@@ -128,6 +132,63 @@ def invert(model, upload, y, lr, shape, iters, tv, seed):
     return dummy.detach()
 
 
+def torch_count_sketch(v, h, sgn, k):
+    return torch.zeros(k, dtype=v.dtype).index_add(0, h, sgn * v)
+
+
+def invert_from_sketch(model, sketch, y, lr, shape, iters, tv, seed, h, sgn, k):
+    """Like invert(), but the attacker only sees a k-dim CountSketch of the upload (C1)."""
+    target = (-sketch / lr).detach()
+    g = torch.Generator().manual_seed(seed)
+    dummy = torch.rand(shape, generator=g).requires_grad_(True)
+    opt = torch.optim.Adam([dummy], lr=0.1)
+    sched = torch.optim.lr_scheduler.MultiStepLR(opt, [int(iters * f) for f in (0.375, 0.625, 0.875)], 0.1)
+    for _ in range(iters):
+        opt.zero_grad()
+        loss = F.cross_entropy(model(dummy), y)
+        dg = flat(torch.autograd.grad(loss, params(model), create_graph=True))
+        rec = 1 - F.cosine_similarity(torch_count_sketch(dg, h, sgn, k), target, dim=0)
+        d = dummy
+        tvl = (d[:, :, 1:, :] - d[:, :, :-1, :]).abs().mean() + (d[:, :, :, 1:] - d[:, :, :, :-1]).abs().mean()
+        (rec + tv * tvl).backward()
+        opt.step()
+        sched.step()
+        with torch.no_grad():
+            dummy.clamp_(0, 1)
+    return dummy.detach()
+
+
+def attack_sketch_inversion(train, dims, batch, iters, lr, seed):
+    """C1 leakage: gradient inversion when the server sees only a k-dim sketch (no DP)."""
+    set_seed(seed)
+    model = simpleCNN(10)
+    model.eval()
+    idx = np.random.default_rng(seed).choice(len(train), batch, replace=False)
+    x, y = stack(train, idx)
+    clean = client_update_one_batch(model, x, y, lr)
+    d = clean.numel()
+    rows, results = [x], []
+    for k in dims:
+        g = torch.Generator().manual_seed(seed + 100 + k)
+        h = torch.randint(0, k, (d,), generator=g)
+        sgn = torch.randint(0, 2, (d,), generator=g).float() * 2 - 1
+        sk = torch_count_sketch(clean, h, sgn, k)
+        rec = invert_from_sketch(model, sk, y, lr, x.shape, iters, 1e-2, seed, h, sgn, k)
+        p = best_match_psnr(x, rec)
+        results.append((k, float(np.mean(p))))
+        rows.append(rec)
+        print(f"  sketch k={k:<5d} ({100.0 * k / d:5.2f}% of {d} numbers) -> mean PSNR {np.mean(p):6.2f} dB",
+              flush=True)
+    try:
+        from torchvision.utils import save_image
+        os.makedirs(OUT, exist_ok=True)
+        save_image(torch.cat(rows), os.path.join(OUT, "sketch_inversion_grid.png"), nrow=batch, padding=2)
+        print(f"  saved {OUT}/sketch_inversion_grid.png (row 1 = originals, then k = {dims})")
+    except Exception as e:
+        print(f"  (could not save image grid: {e})")
+    return results
+
+
 def best_match_psnr(orig, recon):
     """For each original image, PSNR of the closest reconstruction (order-free)."""
     return [max(psnr(recon[j], orig[i]) for j in range(len(recon))) for i in range(len(orig))]
@@ -235,14 +296,27 @@ if __name__ == "__main__":
     ap.add_argument("--shard", type=int, default=500, help="membership: client's training samples")
     ap.add_argument("--epochs", type=int, default=30, help="membership: local epochs")
     ap.add_argument("--rounds", type=int, default=30, help="rounds used for the epsilon column")
+    ap.add_argument("--sketch-dims", type=int, nargs="+", default=[16, 64, 256, 1024],
+                    help="C1: sketch sizes for the sketch-only inversion attack")
+    ap.add_argument("--only-sketch", action="store_true", help="run only the sketch leakage attack")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--quick", action="store_true", help="tiny settings for a smoke test")
     a = ap.parse_args()
     if a.quick:
-        a.sigmas, a.iters, a.shard, a.epochs = [0, 0.1], 200, 200, 5
+        a.sigmas, a.iters, a.shard, a.epochs, a.sketch_dims = [0, 0.1], 200, 200, 5, [64]
 
     torch.set_num_threads(max(1, os.cpu_count() or 1))
     train, test = load_data()
+    print(f"\nAttack 3 (C1): gradient inversion from a k-dim sketch only (batch {a.batch}, {a.iters} steps)")
+    sk_res = attack_sketch_inversion(train, a.sketch_dims, a.batch, a.iters, lr=0.01, seed=a.seed)
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, "sketch_leakage.csv"), "w") as f:
+        f.write("sketch_dim,inversion_psnr_db\n")
+        for k, p in sk_res:
+            f.write(f"{k},{p:.2f}\n")
+    print(f"  saved {OUT}/sketch_leakage.csv  (compare with the sigma=0 PSNR of attack 1 = plaintext update)")
+    if a.only_sketch:
+        raise SystemExit(0)
     print(f"\nAttack 1: gradient inversion (batch {a.batch}, {a.iters} steps, labels known)")
     inv = attack_inversion(train, a.sigmas, a.batch, a.iters, lr=0.01, seed=a.seed)
     print(f"\nAttack 2: membership inference (shard {a.shard}, {a.epochs} local epochs)")

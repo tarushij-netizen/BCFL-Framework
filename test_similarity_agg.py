@@ -219,6 +219,43 @@ hon_ok = all(abs(np.linalg.norm(flat(dps.model_pool[i]) - prev_vec) - 0.5) < 1e-
 att_ok = all(np.linalg.norm(flat(dps.model_pool[i]) - prev_vec) > 1.0 for i in [0, 1])
 check("wrapper: DP on honest clients only, attackers unclipped", hon_ok and att_ok)
 
+# 20-25: C1 prototype (secure aggregation + sketch screening)
+sk = importlib.import_module("server.aggregation_alg.sketchSecAgg")
+rngm = np.random.default_rng(3)
+U = [rngm.standard_normal(D) for _ in range(N)]
+h_, s_ = sk.count_sketch_params(D, 64, 5)
+pk = [sk.client_package(U[i], i, N, 42, h_, s_, 64) for i in range(N)]
+acc_set = [2, 3, 4, 5, 6, 7, 8, 9]
+tot = sk.server_unmask_sum([p[0] for p in pk], acc_set, N, 42, D)
+check("secure agg: unmasked sum over accepted = true sum (rejected = dropouts)",
+      np.allclose(tot, np.sum([U[i] for i in acc_set], axis=0), atol=1e-6))
+hidden = min(np.linalg.norm(pk[i][0] - U[i]) / np.linalg.norm(U[i]) for i in range(N))
+check("secure agg: a single masked upload looks nothing like the update", hidden > 50,
+      f"(mask/update norm ratio >= {hidden:.0f})")
+a_, b_ = rngm.standard_normal(D), rngm.standard_normal(D)
+a_ = a_ + 0.0; b_ = 0.7 * a_ + 0.3 * b_
+cs_true = sk.cosine_similarity(a_, b_)
+cs_sk = sk.cosine_similarity(sk.count_sketch(a_, h_, s_, 64), sk.count_sketch(b_, h_, s_, 64))
+check("sketch keeps cosine roughly (k=64)", abs(cs_true - cs_sk) < 0.15, f"(true {cs_true:.3f}, sketch {cs_sk:.3f})")
+for attack in ["signflip", "noise"]:
+    SK = ra.make_server_class("sketch", attack, malicious=[0, 1], seed=0, agg_kwargs={"sketch_dim": 64})
+    srv = SK()
+    srv.set_global_model(prev)
+    hm = honest_models(N, 13)
+    srv.receive_upload([FakeClient(x) for x in hm])
+    out = srv.aggregate()
+    honest_mean = np.mean([flat(m) for m in hm[2:]], axis=0)
+    check(f"sketch aggregator ({attack}): rejects 0,1 only, result = honest mean",
+          srv.rejected_last_round == [0, 1] and np.allclose(flat(out), honest_mean, atol=1e-6),
+          f"rejected={srv.rejected_last_round} cos={np.round(srv.last_similarities[:3], 2).tolist()}")
+SK0 = ra.make_server_class("sketch", "none", seed=0, agg_kwargs={"sketch_dim": 64})
+srv0 = SK0()
+srv0.set_global_model(prev)
+srv0.receive_upload([FakeClient(x) for x in honest_models(N, 14)])
+srv0.aggregate()
+check("sketch aggregator: no attackers -> nobody rejected", srv0.rejected_last_round == [],
+      f"(min cos {min(srv0.last_similarities):.2f})")
+
 # --- torch checks -------------------------------------------------------------
 if HAVE_TORCH:
     tprev = {k: torch.tensor(v, dtype=torch.float32) for k, v in prev.items()}
@@ -238,8 +275,19 @@ if HAVE_TORCH:
     med = ra.medianTorchAggregator().aggregate(tm)
     check("torch: median returns tensors of right shape",
           torch.is_tensor(med["layer1"]) and med["layer1"].shape == tm[0]["layer1"].shape)
+    sys.path.insert(0, ROOT)
+    from client.poisonedLoader import PoisonedLoader, add_trigger
+    xb = torch.zeros(8, 1, 28, 28)
+    yb = torch.arange(8)
+    lf = list(PoisonedLoader([(xb, yb)], "labelflip"))[0]
+    bd = list(PoisonedLoader([(xb, yb)], "backdoor", target=0, poison_frac=0.5))[0]
+    check("torch: labelflip maps y -> 9 - y", torch.equal(lf[1], 9 - yb))
+    trig_ok = bd[0][:4, 0, -4:-1, -4:-1].min().item() == 1.0 and bd[0][4:].abs().sum().item() == 0
+    check("torch: backdoor puts trigger + target label on half the batch",
+          trig_ok and torch.equal(bd[1][:4], torch.zeros(4, dtype=yb.dtype)) and torch.equal(bd[1][4:], yb[4:])
+          and xb.abs().sum().item() == 0)
 else:
-    print("(torch not installed: 3 torch checks skipped)")
+    print("(torch not installed: 5 torch checks skipped)")
 
 print(f"\n{passed}/{total} checks passed")
 sys.exit(0 if passed == total else 1)

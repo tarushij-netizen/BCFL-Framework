@@ -16,13 +16,19 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--benchmark', type=str, default="FashionMNIST", help="Running Benchmark(See ./config/benchmark.py)")
     # --- defense experiments (all optional; with none of these the original baseline runs unchanged) ---
-    parser.add_argument('--aggregator', choices=['fedavg', 'similarity', 'median', 'krum'], default=None,
+    parser.add_argument('--aggregator', choices=['fedavg', 'similarity', 'median', 'krum', 'sketch'], default=None,
                         help="Use the robust-FL pipeline with this aggregator")
-    parser.add_argument('--attack', choices=['none', 'signflip', 'noise', 'freerider'], default='none')
+    parser.add_argument('--attack', choices=['none', 'signflip', 'noise', 'freerider', 'labelflip', 'backdoor'],
+                        default='none')
+    parser.add_argument('--backdoor-target', type=int, default=0, help="backdoor: class the trigger maps to")
+    parser.add_argument('--poison-frac', type=float, default=0.5,
+                        help="backdoor: share of each malicious batch that gets the trigger")
     parser.add_argument('--num-malicious', type=int, default=0, help="First N clients are attackers")
     parser.add_argument('--attack-scale', type=float, default=5.0)
     parser.add_argument('--sim-threshold', type=float, default=0.1, help="similarity: min cosine")
     parser.add_argument('--mag-ratio', type=float, default=3.0, help="similarity: max norm ratio")
+    parser.add_argument('--sketch-dim', type=int, default=64,
+                        help="sketch (C1): size of the CountSketch the server screens on")
     parser.add_argument('--dp-clip', type=float, default=None,
                         help="Local DP: clip each honest client's update to this L2 norm")
     parser.add_argument('--dp-sigma', type=float, default=0.0,
@@ -49,6 +55,8 @@ if __name__=="__main__":
         global_args['non-iid'] = True
     if args.alpha is not None:
         global_args['alpha'] = args.alpha
+    global_args['backdoor_target'] = args.backdoor_target
+    global_args['poison_frac'] = args.poison_frac
     if args.no_client_test:
         global_args['client_test'] = False
 
@@ -56,6 +64,9 @@ if __name__=="__main__":
         agg_kwargs = {}
         if args.aggregator == 'similarity':
             agg_kwargs = {'similarity_threshold': args.sim_threshold, 'magnitude_ratio': args.mag_ratio}
+        elif args.aggregator == 'sketch':
+            agg_kwargs = {'sketch_dim': args.sketch_dim, 'similarity_threshold': args.sim_threshold,
+                          'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0}
         elif args.aggregator == 'krum':
             agg_kwargs = {'num_byzantine': max(args.num_malicious, 1)}
         algorithm = RobustFL(aggregator=args.aggregator,
@@ -67,6 +78,8 @@ if __name__=="__main__":
                              dp_clip=args.dp_clip,
                              dp_sigma=args.dp_sigma)
         name = f"{args.benchmark}_{args.aggregator}_{args.attack}{args.num_malicious}"
+        if args.aggregator == 'sketch':
+            name += f"_k{args.sketch_dim}"
         if args.dp_clip:
             name += f"_dp{args.dp_clip:g}-{args.dp_sigma:g}"
             from server.aggregation_alg.robustAgg import dp_epsilon

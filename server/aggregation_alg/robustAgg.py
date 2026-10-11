@@ -110,8 +110,13 @@ def dp_epsilon(sigma, rounds, delta=1e-5):
     return float(eps.min())
 
 
+MODEL_ATTACKS = ("signflip", "noise", "freerider")
+
+from .sketchSecAgg import sketchSecAggAggregator
+
 AGGREGATORS = {
     "fedavg": cleanFedavgAggregator,
+    "sketch": sketchSecAggAggregator,
     "similarity": similarityAggregator,
     "median": medianTorchAggregator,
     "krum": krumTorchAggregator,
@@ -167,8 +172,8 @@ def make_server_class(aggregator="fedavg", attack="none", malicious=(), attack_s
                       f"(min {min(norms):.4f}, max {max(norms):.4f}); clip {self.dp_clip}, "
                       f"clipped {clipped}/{len(norms)}, sigma {self.dp_sigma}", flush=True)
             self._round += 1
-            if self.attack == "none" or not self.malicious:
-                return
+            if self.attack not in MODEL_ATTACKS or not self.malicious:
+                return  # data attacks (labelflip/backdoor) poison training data instead
             for i in self.malicious:
                 if i < len(self.model_pool):
                     self.model_pool[i] = poison_state_dict(self.model_pool[i], self._prev_global,

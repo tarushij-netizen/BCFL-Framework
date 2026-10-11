@@ -106,8 +106,20 @@ class Task:
         self.client_list = chain_proxy.get_client_list()
     
     def _construct_client(self):
-        for client_id, _ in self.client_list.items():
-            new_client = self.client(client_id, self.train_dataloader_list[client_id], self.model, 
+        # Data-poisoning attacks (labelflip / backdoor): malicious clients train on poisoned data.
+        attack = getattr(self.server, 'attack', 'none')
+        malicious = set(getattr(self.server, 'malicious', []))
+        data_attack = attack in ('labelflip', 'backdoor')
+        if data_attack:
+            from client.poisonedLoader import PoisonedLoader
+        for ind, (client_id, _) in enumerate(self.client_list.items()):
+            loader = self.train_dataloader_list[client_id]
+            if data_attack and ind in malicious:
+                loader = PoisonedLoader(loader, attack,
+                                        num_classes=self.global_args.get('class_num', 10),
+                                        target=self.global_args.get('backdoor_target', 0),
+                                        poison_frac=self.global_args.get('poison_frac', 0.5))
+            new_client = self.client(client_id, loader, self.model,
                                     self.trainer, self.train_args, self.test_dataloader, self.keys_dict[client_id])
             self.client_pool.append(new_client)
     
@@ -121,6 +133,11 @@ class Task:
         model.to(device)
         model.eval()
         correct, total, loss_sum = 0, 0, 0.0
+        backdoor = getattr(self.server, 'attack', 'none') == 'backdoor'
+        target = self.global_args.get('backdoor_target', 0)
+        hit, cand = 0, 0
+        if backdoor:
+            from client.poisonedLoader import add_trigger
         with torch.no_grad():
             for data, targets in self.test_dataloader:
                 data, targets = data.to(device), targets.to(device)
@@ -128,7 +145,15 @@ class Task:
                 loss_sum += torch.nn.functional.cross_entropy(out, targets, reduction='sum').item()
                 correct += (out.argmax(1) == targets).sum().item()
                 total += targets.size(0)
-        return {'acc': 100.0 * correct / total, 'loss': loss_sum / total}
+                if backdoor:
+                    keep = targets != target
+                    if keep.any():
+                        pred = model(add_trigger(data[keep])).argmax(1)
+                        hit += (pred == target).sum().item()
+                        cand += int(keep.sum().item())
+        res = {'acc': 100.0 * correct / total, 'loss': loss_sum / total}
+        res['asr'] = 100.0 * hit / cand if backdoor and cand else None
+        return res
 
     def run(self):
         self._regist_client()
@@ -151,7 +176,7 @@ class Task:
             f = open(results_path, 'w', newline='')
             writer = csv.writer(f)
             writer.writerow(['round', 'global_acc', 'global_loss', 'rejected',
-                             'malicious_caught', 'honest_rejected'])
+                             'malicious_caught', 'honest_rejected', 'backdoor_asr'])
         client_test = self.global_args.get('client_test', True)
 
         for i in range(self.global_args['communication_round']):
@@ -171,11 +196,14 @@ class Task:
             honest_rej = len([r for r in rejected if r not in malicious])
             logger.info(f"Global round {i}: test acc {res['acc']:.2f}, loss {res['loss']:.4f}, "
                         f"rejected {rejected}, malicious caught {caught}/{len(malicious)}, honest rejected {honest_rej}")
-            print(f"round {i:3d} | global test acc {res['acc']:6.2f}% | loss {res['loss']:.4f} | "
+            asr = res.get('asr')
+            asr_txt = f" | backdoor ASR {asr:6.2f}%" if asr is not None else ""
+            print(f"round {i:3d} | global test acc {res['acc']:6.2f}% | loss {res['loss']:.4f}{asr_txt} | "
                   f"rejected {rejected}", flush=True)
             if writer:
                 writer.writerow([i, f"{res['acc']:.4f}", f"{res['loss']:.6f}",
-                                 ' '.join(map(str, rejected)), caught, honest_rej])
+                                 ' '.join(map(str, rejected)), caught, honest_rej,
+                                 '' if asr is None else f"{asr:.4f}"])
                 f.flush()
         if writer:
             f.close()
