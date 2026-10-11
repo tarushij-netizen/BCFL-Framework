@@ -80,6 +80,36 @@ class krumTorchAggregator(_PoolMixin, ServerAggregator):
         return agg
 
 
+# ----------------------------------------------------------------------------
+# client-side differential privacy (clip + Gaussian noise on the update)
+# ----------------------------------------------------------------------------
+def privatize_state_dict(local, prev_global, clip, sigma, rng):
+    """Local DP on one client's update: u = local - prev; clip u to L2 norm `clip`;
+    add N(0, (sigma*clip)^2) to every coordinate; return prev + u.
+    Returns (new_state_dict, raw_update_norm)."""
+    keys = _float_keys(local)
+    prev = _flatten(prev_global, keys)
+    u = _flatten(local, keys) - prev
+    norm = float(np.linalg.norm(u))
+    if norm > clip > 0:
+        u = u * (clip / norm)
+    if sigma > 0:
+        u = u + rng.normal(0.0, sigma * clip, size=u.shape)
+    return _unflatten_like(prev + u, local, keys), norm
+
+
+def dp_epsilon(sigma, rounds, delta=1e-5):
+    """Client-level (epsilon, delta) for `rounds` Gaussian-mechanism releases with noise
+    multiplier `sigma`, every client participating every round (no subsampling), via
+    Renyi DP: eps(a) = rounds*a/(2 sigma^2) + log(1/delta)/(a-1), minimised over a.
+    Conservative upper bound (Mironov 2017)."""
+    if sigma <= 0:
+        return float("inf")
+    alphas = np.concatenate([np.linspace(1.01, 10, 400), np.arange(11, 2000)])
+    eps = rounds * alphas / (2 * sigma ** 2) + np.log(1 / delta) / (alphas - 1)
+    return float(eps.min())
+
+
 AGGREGATORS = {
     "fedavg": cleanFedavgAggregator,
     "similarity": similarityAggregator,
@@ -89,13 +119,15 @@ AGGREGATORS = {
 
 
 def make_server_class(aggregator="fedavg", attack="none", malicious=(), attack_scale=5.0,
-                      seed=0, agg_kwargs=None):
+                      seed=0, agg_kwargs=None, dp_clip=None, dp_sigma=0.0):
     """Return an aggregator CLASS (Task calls it with no arguments) that
     1. snapshots uploads each round,
     2. replaces the uploads of `malicious` client indices (0-based) with poisoned ones
        built from the previous global model,
     3. runs the chosen aggregator,
     4. records which clients it rejected, for detection metrics.
+    If dp_clip is set, every HONEST client's update is clipped and noised (local DP)
+    before upload; attackers do not follow the protocol, so they are not privatized.
     """
     base = AGGREGATORS[aggregator]
     agg_kwargs = dict(agg_kwargs or {})
@@ -109,6 +141,10 @@ def make_server_class(aggregator="fedavg", attack="none", malicious=(), attack_s
             self.attack_scale = attack_scale
             self._rng = np.random.default_rng(seed)
             self._prev_global = None
+            self.dp_clip = dp_clip
+            self.dp_sigma = dp_sigma
+            self._dp_rng = np.random.default_rng(seed + 12345)
+            self._round = 0
 
         def set_global_model(self, state_dict):
             base.set_global_model(self, state_dict)
@@ -116,10 +152,23 @@ def make_server_class(aggregator="fedavg", attack="none", malicious=(), attack_s
 
         def receive_upload(self, client_pool):
             base.receive_upload(self, client_pool)
-            if self.attack == "none" or not self.malicious:
-                return
             if self._prev_global is None:
                 raise RuntimeError("set_global_model() must be called before round 0")
+            if self.dp_clip:
+                norms = []
+                for i in range(len(self.model_pool)):
+                    if i in self.malicious and self.attack != "none":
+                        continue
+                    self.model_pool[i], n = privatize_state_dict(self.model_pool[i], self._prev_global,
+                                                                 self.dp_clip, self.dp_sigma, self._dp_rng)
+                    norms.append(n)
+                clipped = sum(n > self.dp_clip for n in norms)
+                print(f"[DP] round {self._round}: honest update norm median {np.median(norms):.4f} "
+                      f"(min {min(norms):.4f}, max {max(norms):.4f}); clip {self.dp_clip}, "
+                      f"clipped {clipped}/{len(norms)}, sigma {self.dp_sigma}", flush=True)
+            self._round += 1
+            if self.attack == "none" or not self.malicious:
+                return
             for i in self.malicious:
                 if i < len(self.model_pool):
                     self.model_pool[i] = poison_state_dict(self.model_pool[i], self._prev_global,

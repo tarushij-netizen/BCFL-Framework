@@ -57,8 +57,9 @@ class RobustFL(Algorithm):
     malicious:  0-based client indices whose uploads are poisoned
     """
     def __init__(self, aggregator="similarity", attack="none", malicious=(),
-                 attack_scale=5.0, seed=0, agg_kwargs=None):
-        server = make_server_class(aggregator, attack, malicious, attack_scale, seed, agg_kwargs)
+                 attack_scale=5.0, seed=0, agg_kwargs=None, dp_clip=None, dp_sigma=0.0):
+        server = make_server_class(aggregator, attack, malicious, attack_scale, seed, agg_kwargs,
+                                   dp_clip, dp_sigma)
         super(RobustFL, self).__init__(server=server)
 
 

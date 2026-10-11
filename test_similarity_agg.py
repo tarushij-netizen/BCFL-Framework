@@ -195,6 +195,30 @@ s0.aggregate()
 check("default: attackers rejected already in round 0", s0.rejected_last_round == [0, 1],
       f"rejected={s0.rejected_last_round}")
 
+# 15-19: local DP
+rng_dp = np.random.default_rng(0)
+m = honest_models(1, 11)[0]
+out, n = ra.privatize_state_dict(m, prev, clip=1e9, sigma=0.0, rng=rng_dp)
+check("DP off (huge clip, sigma 0) leaves update unchanged", np.allclose(flat(out), flat(m)))
+out, n = ra.privatize_state_dict(m, prev, clip=0.5, sigma=0.0, rng=rng_dp)
+check("DP clip scales update norm to clip", abs(np.linalg.norm(flat(out) - prev_vec) - 0.5) < 1e-9,
+      f"(raw norm {n:.3f})")
+out, _ = ra.privatize_state_dict(make_dict(prev_vec.copy()), prev, clip=1.0, sigma=2.0,
+                                 rng=np.random.default_rng(1))
+check("DP noise std = sigma*clip", abs(np.std(flat(out) - prev_vec) - 2.0) < 0.2,
+      f"(std {np.std(flat(out) - prev_vec):.3f})")
+e1, e2 = ra.dp_epsilon(1.0, 50), ra.dp_epsilon(4.0, 50)
+check("epsilon falls as sigma rises; infinite without noise",
+      e2 < e1 and ra.dp_epsilon(0, 50) == float("inf"), f"(eps sigma1={e1:.1f}, sigma4={e2:.1f})")
+DPS = ra.make_server_class("fedavg", "signflip", malicious=[0, 1], seed=0, dp_clip=0.5, dp_sigma=0.0)
+dps = DPS()
+dps.set_global_model(prev)
+hm = honest_models(N, 12)
+dps.receive_upload([FakeClient(x) for x in hm])
+hon_ok = all(abs(np.linalg.norm(flat(dps.model_pool[i]) - prev_vec) - 0.5) < 1e-9 for i in range(2, N))
+att_ok = all(np.linalg.norm(flat(dps.model_pool[i]) - prev_vec) > 1.0 for i in [0, 1])
+check("wrapper: DP on honest clients only, attackers unclipped", hon_ok and att_ok)
+
 # --- torch checks -------------------------------------------------------------
 if HAVE_TORCH:
     tprev = {k: torch.tensor(v, dtype=torch.float32) for k, v in prev.items()}

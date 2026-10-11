@@ -23,6 +23,10 @@ if __name__=="__main__":
     parser.add_argument('--attack-scale', type=float, default=5.0)
     parser.add_argument('--sim-threshold', type=float, default=0.1, help="similarity: min cosine")
     parser.add_argument('--mag-ratio', type=float, default=3.0, help="similarity: max norm ratio")
+    parser.add_argument('--dp-clip', type=float, default=None,
+                        help="Local DP: clip each honest client's update to this L2 norm")
+    parser.add_argument('--dp-sigma', type=float, default=0.0,
+                        help="Local DP: Gaussian noise multiplier (noise std = sigma * clip)")
     parser.add_argument('--rounds', type=int, default=None, help="Override communication rounds")
     parser.add_argument('--non-iid', action='store_true', help="Dirichlet split")
     parser.add_argument('--alpha', type=float, default=None, help="Dirichlet alpha (smaller = more skewed)")
@@ -59,8 +63,16 @@ if __name__=="__main__":
                              malicious=range(args.num_malicious),
                              attack_scale=args.attack_scale,
                              seed=args.seed or 0,
-                             agg_kwargs=agg_kwargs)
+                             agg_kwargs=agg_kwargs,
+                             dp_clip=args.dp_clip,
+                             dp_sigma=args.dp_sigma)
         name = f"{args.benchmark}_{args.aggregator}_{args.attack}{args.num_malicious}"
+        if args.dp_clip:
+            name += f"_dp{args.dp_clip:g}-{args.dp_sigma:g}"
+            from server.aggregation_alg.robustAgg import dp_epsilon
+            eps = dp_epsilon(args.dp_sigma, global_args['communication_round'])
+            print(f"DP: clip {args.dp_clip}, sigma {args.dp_sigma}, "
+                  f"epsilon after {global_args['communication_round']} rounds = {eps:.2f} (delta 1e-5)")
         if args.seed is not None:
             name += f"_seed{args.seed}"
         global_args['results_csv'] = args.results or f"results/{name}.csv"
