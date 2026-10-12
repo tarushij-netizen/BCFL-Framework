@@ -29,6 +29,9 @@ if __name__=="__main__":
     parser.add_argument('--mag-ratio', type=float, default=3.0, help="similarity: max norm ratio")
     parser.add_argument('--sketch-dim', type=int, default=64,
                         help="sketch (C1): size of the CountSketch the server screens on")
+    parser.add_argument('--class-check', action='store_true',
+                        help="sketch/repsketch: also reject clients whose output-layer class profile is an outlier")
+    parser.add_argument('--class-mad', type=float, default=3.0, help="class check: robust z-score cut-off")
     parser.add_argument('--rep-init', type=float, default=0.75, help="repsketch (C3): starting reputation")
     parser.add_argument('--rep-beta', type=float, default=0.7, help="repsketch: memory (higher = slower change)")
     parser.add_argument('--rep-tau', type=float, default=0.6, help="repsketch: minimum reputation to take part")
@@ -70,7 +73,8 @@ if __name__=="__main__":
             agg_kwargs = {'similarity_threshold': args.sim_threshold, 'magnitude_ratio': args.mag_ratio}
         elif args.aggregator in ('sketch', 'repsketch'):
             agg_kwargs = {'sketch_dim': args.sketch_dim, 'similarity_threshold': args.sim_threshold,
-                          'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0}
+                          'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0,
+                          'class_check': args.class_check, 'class_mad': args.class_mad}
             if args.aggregator == 'repsketch':
                 agg_kwargs.update({'reputation': True, 'rep_init': args.rep_init,
                                    'rep_beta': args.rep_beta, 'rep_tau': args.rep_tau,
@@ -88,6 +92,8 @@ if __name__=="__main__":
         name = f"{args.benchmark}_{args.aggregator}_{args.attack}{args.num_malicious}"
         if args.aggregator in ('sketch', 'repsketch'):
             name += f"_k{args.sketch_dim}"
+            if args.class_check:
+                name += f"_cls{args.class_mad:g}"
         if args.dp_clip:
             name += f"_dp{args.dp_clip:g}-{args.dp_sigma:g}"
             from server.aggregation_alg.robustAgg import dp_epsilon

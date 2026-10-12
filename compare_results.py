@@ -2,6 +2,7 @@
 import csv
 import glob
 import os
+import re
 import sys
 
 folder = sys.argv[1] if len(sys.argv) > 1 else "results"
@@ -28,3 +29,21 @@ for r in rows:
 print("\nfinal/last5/best = global model test accuracy (%). caught = attacker uploads rejected "
       "(summed over rounds), honestRej = honest uploads rejected, ASR = final backdoor attack success rate (%). Krum 'rejects' every client "
       "except the one it picks, so its honestRej is large by design.")
+
+
+# ---- mean +- std over seeds (runs whose names differ only in _seedN)
+groups = {}
+for r in rows:
+    m = re.match(r"(.*)_seed(\d+)$", r[0])
+    if m:
+        groups.setdefault(m.group(1), []).append(r)
+multi = {k: v for k, v in groups.items() if len(v) > 1}
+if multi:
+    def ms(xs):
+        mu = sum(xs) / len(xs)
+        sd = (sum((x - mu) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+        return f"{mu:6.2f} +- {sd:4.2f}"
+    print(f"\n{'run (over seeds)':55s} {'n':>2s} {'final acc':>15s} {'ASR':>15s}")
+    for k, v in sorted(multi.items()):
+        asrs = [float(x[7]) for x in v if x[7] != "-"]
+        print(f"{k:55s} {len(v):2d} {ms([x[2] for x in v]):>15s} {ms(asrs) if len(asrs) > 1 else '-':>15s}")

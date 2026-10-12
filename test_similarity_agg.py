@@ -282,6 +282,29 @@ check("repsketch: on-off attackers excluded even in rounds where they behave", s
 check("repsketch: honest clients keep full reputation", min(agg.last_reputation[2:]) > 0.9,
       f"(min honest r {min(agg.last_reputation[2:]):.2f})")
 
+# 30-32: class-profile check for backdoor-like attacks
+rb = np.random.default_rng(31)
+C, FE = 10, 40
+base3 = {"body": rb.standard_normal(500), "head.w": rb.standard_normal((C, FE)), "head.b": rb.standard_normal(C)}
+sig3 = {k: 0.3 * rb.standard_normal(v.shape) for k, v in base3.items()}
+def toy3(attacker, r):
+    m = {k: base3[k] + sig3[k] + 0.3 * r.standard_normal(base3[k].shape) for k in base3}
+    if attacker:  # extra push on class 0's output row only (what a backdoor to class 0 does)
+        m["head.w"][0] += 1.5 * r.standard_normal(FE)
+        m["head.b"][0] += 1.5
+    return m
+def run_cls(on, attackers=2):
+    ag = sk.sketchSecAggAggregator(sketch_dim=64, seed=0, class_check=on)
+    ag.set_global_model(base3)
+    ag.aggregate([toy3(i < attackers, np.random.default_rng(40 + i)) for i in range(N)])
+    return ag.rejected_last_round
+check("class check off: class-0 attackers slip through the sketch", run_cls(False) == [],
+      f"(rejected {run_cls(False)})")
+check("class check on: class-0 attackers rejected, honest kept", run_cls(True) == [0, 1],
+      f"(rejected {run_cls(True)})")
+check("class check on, no attackers: nobody rejected", run_cls(True, attackers=0) == [],
+      f"(rejected {run_cls(True, attackers=0)})")
+
 # --- torch checks -------------------------------------------------------------
 if HAVE_TORCH:
     tprev = {k: torch.tensor(v, dtype=torch.float32) for k, v in prev.items()}

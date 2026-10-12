@@ -14,6 +14,12 @@ Attack 3  (C1) Gradient inversion when the attacker sees only a k-dimensional Co
           of the update, as the server does in sketchSecAgg. Saves results/sketch_leakage.csv
           and results/sketch_inversion_grid.png. Compare with attack 1 at sigma 0 (plaintext).
 
+Attack 4  Analytic attack (Phong et al. 2017): from a batch-1 update the input features of the
+          last layer are recovered exactly (dW[i] / db[i]); an image is then fitted to them.
+          Reported: feature cosine (1.0 = exact recovery) and image PSNR next to the all-black
+          baseline. Run with --analytic-only. This replaces attacks 1/3 as the leakage evidence,
+          because their reconstructions did not beat an all-black image.
+
 Attack 2  Membership inference (loss threshold, Yeom et al. 2018). A client trains on a small
           shard (members); the attacker gets the released model and guesses "member" when the
           loss on a sample is low. Metric: AUC (0.5 = no leak, 1.0 = full leak) plus the
@@ -234,6 +240,109 @@ def attack_inversion(train, sigmas, batch, iters, lr, seed):
     return results
 
 
+# ------------------------------------------------------------------ attack 4 (analytic)
+def features(model, x):
+    """Input to the last linear layer (everything in the stack except that layer)."""
+    return model.linear_relu_stack[:-1](x)
+
+
+def analytic_feature_recovery(g, sizes):
+    """Phong et al. 2017: for batch 1, dL/dW = delta h^T and dL/db = delta, so any row i
+    with delta_i != 0 gives h = dW[i] / db[i] exactly. g = gradient estimate (flat)."""
+    n_w, n_b = sizes[-2], sizes[-1]
+    dW = g[-(n_w + n_b):-n_b].view(n_b, -1)
+    db = g[-n_b:]
+    i = int(db.abs().argmax())
+    return dW[i] / db[i]
+
+
+def invert_features(model, h_target, shape, iters, tv, seed):
+    """Find an image whose last-layer features match h_target."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.rand(shape, generator=g).requires_grad_(True)
+    opt = torch.optim.Adam([x], lr=0.05)
+    scale = h_target.norm().clamp_min(1e-8)
+    for _ in range(iters):
+        opt.zero_grad()
+        f = features(model, x).view(-1)
+        loss = ((f - h_target) ** 2).sum() / scale ** 2
+        tvl = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean() + (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+        (loss + tv * tvl).backward()
+        opt.step()
+        with torch.no_grad():
+            x.clamp_(0, 1)
+    return x.detach()
+
+
+def attack_analytic(train, sigmas, dims, iters, lr, seed, n_images=4):
+    """Attack 4: exact feature recovery from a batch-1 update, then image inversion from
+    the features. Run on the plaintext update, DP-noised updates and C1 sketches (the
+    attacker's best per-coordinate estimate from a CountSketch is s[c] * sketch[h[c]])."""
+    set_seed(seed)
+    model = simpleCNN(10)
+    model.eval()
+    sizes = [p.numel() for p in params(model)]
+    d = sum(sizes)
+    rng = np.random.default_rng(seed + 50)
+    idx = rng.choice(len(train), n_images, replace=False)
+    settings = [("plaintext", 0.0, None)] + [("DP", s_, None) for s_ in sigmas if s_ > 0] + \
+               [("sketch", 0.0, k) for k in dims]
+    stats = {st: {"cos": [], "psnr": []} for st in settings}
+    rows = {st: [] for st in settings}
+    originals, blacks = [], []
+    for n, j in enumerate(idx):
+        x, y = stack(train, [j])
+        originals.append(x)
+        blacks.append(psnr(torch.zeros_like(x[0]), x[0]))
+        h_true = features(model, x).view(-1).detach()
+        clean = client_update_one_batch(model, x, y, lr).detach()
+        gen = torch.Generator().manual_seed(seed + 200 + n)
+        for st in settings:
+            kind, sig, k = st
+            if kind == "plaintext":
+                up = clean
+            elif kind == "DP":
+                up = privatize(clean.clone(), sig, clean.norm().item(), gen)
+            else:
+                gk = torch.Generator().manual_seed(seed + 100 + k)
+                hh = torch.randint(0, k, (d,), generator=gk)
+                sg = torch.randint(0, 2, (d,), generator=gk).float() * 2 - 1
+                up = sg * torch_count_sketch(clean, hh, sg, k)[hh]   # unbiased estimate of each coordinate
+            h_hat = analytic_feature_recovery(-up / lr, sizes)
+            cos = F.cosine_similarity(h_hat, h_true, dim=0).item()
+            rec = invert_features(model, h_hat, x.shape, iters, 1e-3, seed)
+            stats[st]["cos"].append(cos)
+            stats[st]["psnr"].append(psnr(rec[0], x[0]))
+            rows[st].append(rec)
+    print(f"  blind baseline (all-black image): {np.mean(blacks):6.2f} dB")
+    up_bound = invert_features(model, features(model, originals[0]).view(-1).detach(),
+                               originals[0].shape, iters, 1e-3, seed)
+    print(f"  (feature-inversion ceiling on image 1, true features: {psnr(up_bound[0], originals[0][0]):.2f} dB)")
+    results = []
+    for st in settings:
+        kind, sig, k = st
+        label = kind if kind == "plaintext" else (f"DP sigma {sig:g}" if kind == "DP" else f"sketch k={k}")
+        c, p_ = float(np.mean(stats[st]["cos"])), float(np.mean(stats[st]["psnr"]))
+        results.append((label, c, p_, float(np.mean(blacks))))
+        print(f"  {label:16s} feature cosine {c:6.3f} | image PSNR {p_:6.2f} dB "
+              f"({p_ - np.mean(blacks):+.2f} vs black)", flush=True)
+    try:
+        from torchvision.utils import save_image
+        os.makedirs(OUT, exist_ok=True)
+        grid = [torch.cat(originals)] + [torch.cat(rows[st]) for st in settings]
+        save_image(torch.cat(grid), os.path.join(OUT, "analytic_inversion_grid.png"), nrow=n_images, padding=2)
+        print(f"  saved {OUT}/analytic_inversion_grid.png (row 1 = originals, then: "
+              + ", ".join(r[0] for r in results) + ")")
+    except Exception as e:
+        print(f"  (could not save image grid: {e})")
+    with open(os.path.join(OUT, "analytic_leakage.csv"), "w") as f:
+        f.write("setting,feature_cosine,image_psnr_db,black_baseline_db\n")
+        for r in results:
+            f.write(f"{r[0]},{r[1]:.4f},{r[2]:.2f},{r[3]:.2f}\n")
+    print(f"  saved {OUT}/analytic_leakage.csv")
+    return results
+
+
 # ------------------------------------------------------------------ attack 2
 def train_local(model, x, y, epochs, lr, bs=32, seed=0):
     g = torch.Generator().manual_seed(seed)
@@ -313,6 +422,8 @@ if __name__ == "__main__":
                     help="C1: sketch sizes for the sketch-only inversion attack")
     ap.add_argument("--only-sketch", action="store_true", help="run only the sketch leakage attack")
     ap.add_argument("--skip-mia", action="store_true", help="skip membership inference (attack 2)")
+    ap.add_argument("--analytic-only", action="store_true",
+                    help="run only attack 4 (analytic feature recovery + image inversion)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--quick", action="store_true", help="tiny settings for a smoke test")
     a = ap.parse_args()
@@ -321,6 +432,10 @@ if __name__ == "__main__":
 
     torch.set_num_threads(max(1, os.cpu_count() or 1))
     train, test = load_data()
+    if a.analytic_only:
+        print(f"\nAttack 4: analytic feature recovery (batch 1, 4 images, {a.iters} inversion steps)")
+        attack_analytic(train, a.sigmas, a.sketch_dims, a.iters, lr=0.01, seed=a.seed)
+        raise SystemExit(0)
     print(f"\nBlind baselines (batch {a.batch})")
     blind_black, blind_avg = blind_baselines(train, a.batch, a.seed)
     print(f"\nAttack 3 (C1): gradient inversion from a k-dim sketch only (batch {a.batch}, {a.iters} steps)")

@@ -118,10 +118,18 @@ class Reputation:
 class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
     def __init__(self, sketch_dim=64, similarity_threshold=0.1, magnitude_ratio=3.0,
                  mask_scale=100.0, seed=0, reputation=False, rep_init=0.75, rep_beta=0.7, rep_tau=0.6,
-                 rep_penalty=0.5, model=None, args=None):
+                 rep_penalty=0.5, class_check=False, class_mad=3.0, model=None, args=None):
         ServerAggregator.__init__(self, model, args)
+        # Backdoor signal: each client also reports its "class profile" = the share of its
+        # output-layer update that falls on each class row (C numbers, e.g. 10). A backdoor
+        # drags the model toward one target class, so the attacker's profile is lopsided.
+        # Clients whose profile is far from the median profile (robust z-score > class_mad)
+        # are rejected. Privacy cost: the profile hints at the client's label mix.
+        self.class_check = class_check
+        self.class_mad = class_mad
         self.reputation = Reputation(rep_init, rep_beta, rep_tau, rep_penalty) if reputation else None
         self.last_reputation = []
+        self.last_head_rejected = []
         self.k = sketch_dim
         self.similarity_threshold = similarity_threshold
         self.magnitude_ratio = magnitude_ratio
@@ -139,6 +147,16 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         update (reputation from earlier rounds); None = plain average."""
         sketches = [p[1] for p in packages]
         accepted, sims, ratios = screen(sketches, self.similarity_threshold, self.magnitude_ratio)
+        self.last_head_rejected = []
+        if self.class_check and packages[0][2] is not None:
+            P = np.stack([p[2] for p in packages])
+            med = np.median(P, axis=0)
+            dist = np.abs(P - med).sum(axis=1)                    # L1 distance to the median profile
+            mad = np.median(np.abs(dist - np.median(dist))) + 1e-12
+            z = (dist - np.median(dist)) / (1.4826 * mad)
+            self.last_class_z = np.round(z, 2).tolist()
+            self.last_head_rejected = [i for i in accepted if z[i] > self.class_mad]
+            accepted = [i for i in accepted if z[i] <= self.class_mad]
         if self.reputation is not None:
             self.reputation.update({i: (i in accepted) for i in range(n)})
             accepted = self.reputation.eligible(accepted)
@@ -158,6 +176,9 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         d = len(ref)
         round_seed = int(self.seed * 100003 + self.round)
         h, s = count_sketch_params(d, self.k, round_seed + 7)
+        if self.class_check:
+            w_key, b_key = keys[-2], keys[-1]
+            n_cls = _to_numpy(models[0][b_key]).size
 
         # public weights from earlier rounds (reputation); clients pre-scale their update by it
         weights = None if self.reputation is None else [self.reputation.get(i) for i in range(n)]
@@ -168,7 +189,13 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             u = _flatten(m, keys) - ref
             masked, _ = client_package(u if weights is None else weights[i] * u, i, n, round_seed,
                                        h, s, self.k, self.mask_scale)
-            packages.append((masked, count_sketch(u, h, s, self.k)))  # sketch of the unscaled update
+            prof = None
+            if self.class_check:
+                dw = (_to_numpy(m[w_key]) - _to_numpy(self.reference_model[w_key])).reshape(n_cls, -1)
+                db = (_to_numpy(m[b_key]) - _to_numpy(self.reference_model[b_key])).reshape(n_cls, 1)
+                rows = np.linalg.norm(np.hstack([dw, db]), axis=1)
+                prof = rows / (rows.sum() + 1e-12)
+            packages.append((masked, count_sketch(u, h, s, self.k), prof))  # sketch + class profile
         # server side: sees only packages
         mean_update, accepted, sims, ratios = self._server_round(packages, d, round_seed, n, weights)
         if self.reputation is not None:
@@ -180,8 +207,9 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         logger.info(f"[sketchSecAgg] round {self.round}: k={self.k} cos={np.round(sims, 3).tolist()} "
                     f"ratio={np.round(ratios, 2).tolist()} rejected={self.rejected_last_round}")
         if self.rejected_last_round:
+            extra = f" (class-profile check: {self.last_head_rejected})" if self.class_check else ""
             print(f"[sketchSecAgg] round {self.round}: rejected clients (0-based index) "
-                  f"{self.rejected_last_round}")
+                  f"{self.rejected_last_round}{extra}")
 
         from .robustAgg import _unflatten_like
         if mean_update is None:
