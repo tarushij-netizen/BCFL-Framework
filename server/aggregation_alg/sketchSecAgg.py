@@ -86,11 +86,42 @@ def screen(vectors, similarity_threshold, magnitude_ratio):
     return accepted, sims, ratios
 
 
+# ---------------------------------------------------------------------------- reputation (C3)
+class Reputation:
+    """Per-client reputation from screening verdicts, asymmetric (trust is lost faster
+    than it is earned):
+        accepted:  r <- beta * r + (1 - beta)
+        rejected:  r <- penalty * r
+    A client takes part in aggregation only if r >= tau, and is weighted by r.
+    With beta 0.7, penalty 0.5, tau 0.6: a client rejected every other round is kept out
+    from its second round on (r 0.75 -> 0.375 -> 0.56 -> ...), while an honest client with
+    one false rejection sits out one round and is back after one accepted round.
+    New identities start at `init` (Sybil handling: set it below tau so they must earn trust)."""
+
+    def __init__(self, init=0.75, beta=0.7, tau=0.6, penalty=0.5):
+        self.init, self.beta, self.tau, self.penalty = init, beta, tau, penalty
+        self.r = {}
+
+    def get(self, i):
+        return self.r.get(i, self.init)
+
+    def update(self, verdicts):
+        for i, v in verdicts.items():
+            r = self.get(i)
+            self.r[i] = self.beta * r + (1 - self.beta) if v else self.penalty * r
+
+    def eligible(self, ids):
+        return [i for i in ids if self.get(i) >= self.tau]
+
+
 # ---------------------------------------------------------------------------- aggregator
 class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
     def __init__(self, sketch_dim=64, similarity_threshold=0.1, magnitude_ratio=3.0,
-                 mask_scale=100.0, seed=0, model=None, args=None):
+                 mask_scale=100.0, seed=0, reputation=False, rep_init=0.75, rep_beta=0.7, rep_tau=0.6,
+                 rep_penalty=0.5, model=None, args=None):
         ServerAggregator.__init__(self, model, args)
+        self.reputation = Reputation(rep_init, rep_beta, rep_tau, rep_penalty) if reputation else None
+        self.last_reputation = []
         self.k = sketch_dim
         self.similarity_threshold = similarity_threshold
         self.magnitude_ratio = magnitude_ratio
@@ -103,13 +134,19 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self.last_norm_ratios = []
 
     # ----- the only function that plays the server role
-    def _server_round(self, packages, d, round_seed, n):
+    def _server_round(self, packages, d, round_seed, n, weights=None):
+        """weights: public per-client weights the clients already multiplied into their
+        update (reputation from earlier rounds); None = plain average."""
         sketches = [p[1] for p in packages]
         accepted, sims, ratios = screen(sketches, self.similarity_threshold, self.magnitude_ratio)
+        if self.reputation is not None:
+            self.reputation.update({i: (i in accepted) for i in range(n)})
+            accepted = self.reputation.eligible(accepted)
         if not accepted:
             return None, accepted, sims, ratios
         total = server_unmask_sum([p[0] for p in packages], accepted, n, round_seed, d, self.mask_scale)
-        return total / len(accepted), accepted, sims, ratios
+        denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
+        return total / denom, accepted, sims, ratios
 
     def _aggregate_alg(self, raw_client_model_or_grad_list=None):
         models = raw_client_model_or_grad_list or self.model_pool
@@ -122,11 +159,21 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         round_seed = int(self.seed * 100003 + self.round)
         h, s = count_sketch_params(d, self.k, round_seed + 7)
 
+        # public weights from earlier rounds (reputation); clients pre-scale their update by it
+        weights = None if self.reputation is None else [self.reputation.get(i) for i in range(n)]
+
         # client side (each client computes its own package from its own update)
-        packages = [client_package(_flatten(m, keys) - ref, i, n, round_seed, h, s, self.k, self.mask_scale)
-                    for i, m in enumerate(models)]
+        packages = []
+        for i, m in enumerate(models):
+            u = _flatten(m, keys) - ref
+            masked, _ = client_package(u if weights is None else weights[i] * u, i, n, round_seed,
+                                       h, s, self.k, self.mask_scale)
+            packages.append((masked, count_sketch(u, h, s, self.k)))  # sketch of the unscaled update
         # server side: sees only packages
-        mean_update, accepted, sims, ratios = self._server_round(packages, d, round_seed, n)
+        mean_update, accepted, sims, ratios = self._server_round(packages, d, round_seed, n, weights)
+        if self.reputation is not None:
+            self.last_reputation = [round(self.reputation.get(i), 3) for i in range(n)]
+            logger.info(f"[sketchSecAgg] round {self.round}: reputation {self.last_reputation}")
 
         self.rejected_last_round = [i for i in range(n) if i not in accepted]
         self.last_similarities, self.last_norm_ratios = sims, ratios

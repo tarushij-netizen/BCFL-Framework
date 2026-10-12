@@ -16,7 +16,7 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--benchmark', type=str, default="FashionMNIST", help="Running Benchmark(See ./config/benchmark.py)")
     # --- defense experiments (all optional; with none of these the original baseline runs unchanged) ---
-    parser.add_argument('--aggregator', choices=['fedavg', 'similarity', 'median', 'krum', 'sketch'], default=None,
+    parser.add_argument('--aggregator', choices=['fedavg', 'similarity', 'median', 'krum', 'sketch', 'repsketch'], default=None,
                         help="Use the robust-FL pipeline with this aggregator")
     parser.add_argument('--attack', choices=['none', 'signflip', 'noise', 'freerider', 'labelflip', 'backdoor'],
                         default='none')
@@ -29,6 +29,10 @@ if __name__=="__main__":
     parser.add_argument('--mag-ratio', type=float, default=3.0, help="similarity: max norm ratio")
     parser.add_argument('--sketch-dim', type=int, default=64,
                         help="sketch (C1): size of the CountSketch the server screens on")
+    parser.add_argument('--rep-init', type=float, default=0.75, help="repsketch (C3): starting reputation")
+    parser.add_argument('--rep-beta', type=float, default=0.7, help="repsketch: memory (higher = slower change)")
+    parser.add_argument('--rep-tau', type=float, default=0.6, help="repsketch: minimum reputation to take part")
+    parser.add_argument('--rep-penalty', type=float, default=0.5, help="repsketch: reputation multiplier on rejection")
     parser.add_argument('--dp-clip', type=float, default=None,
                         help="Local DP: clip each honest client's update to this L2 norm")
     parser.add_argument('--dp-sigma', type=float, default=0.0,
@@ -64,9 +68,13 @@ if __name__=="__main__":
         agg_kwargs = {}
         if args.aggregator == 'similarity':
             agg_kwargs = {'similarity_threshold': args.sim_threshold, 'magnitude_ratio': args.mag_ratio}
-        elif args.aggregator == 'sketch':
+        elif args.aggregator in ('sketch', 'repsketch'):
             agg_kwargs = {'sketch_dim': args.sketch_dim, 'similarity_threshold': args.sim_threshold,
                           'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0}
+            if args.aggregator == 'repsketch':
+                agg_kwargs.update({'reputation': True, 'rep_init': args.rep_init,
+                                   'rep_beta': args.rep_beta, 'rep_tau': args.rep_tau,
+                                   'rep_penalty': args.rep_penalty})
         elif args.aggregator == 'krum':
             agg_kwargs = {'num_byzantine': max(args.num_malicious, 1)}
         algorithm = RobustFL(aggregator=args.aggregator,
@@ -78,7 +86,7 @@ if __name__=="__main__":
                              dp_clip=args.dp_clip,
                              dp_sigma=args.dp_sigma)
         name = f"{args.benchmark}_{args.aggregator}_{args.attack}{args.num_malicious}"
-        if args.aggregator == 'sketch':
+        if args.aggregator in ('sketch', 'repsketch'):
             name += f"_k{args.sketch_dim}"
         if args.dp_clip:
             name += f"_dp{args.dp_clip:g}-{args.dp_sigma:g}"

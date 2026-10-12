@@ -117,6 +117,7 @@ from .sketchSecAgg import sketchSecAggAggregator
 AGGREGATORS = {
     "fedavg": cleanFedavgAggregator,
     "sketch": sketchSecAggAggregator,
+    "repsketch": sketchSecAggAggregator,  # same class with reputation=True (set in test.py)
     "similarity": similarityAggregator,
     "median": medianTorchAggregator,
     "krum": krumTorchAggregator,

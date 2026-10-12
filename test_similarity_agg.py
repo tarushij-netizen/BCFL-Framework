@@ -256,6 +256,32 @@ srv0.aggregate()
 check("sketch aggregator: no attackers -> nobody rejected", srv0.rejected_last_round == [],
       f"(min cos {min(srv0.last_similarities):.2f})")
 
+# 26-29: C3 reputation
+R = sk.Reputation(init=0.75, beta=0.7, tau=0.6)
+for t in range(10):
+    R.update({0: t % 2 == 1, 1: True if t != 3 else False})   # 0 = on-off attacker, 1 = honest, 1 false reject
+check("reputation: on-off attacker kept out, honest client with one false rejection stays in",
+      R.eligible([0, 1]) == [1], f"(r0={R.get(0):.3f}, r1={R.get(1):.3f})")
+check("reputation: new identity starting below tau must earn trust",
+      sk.Reputation(init=0.5).eligible([7]) == [])
+
+agg = sk.sketchSecAggAggregator(sketch_dim=64, seed=0, reputation=True)
+agg.set_global_model(prev)
+seen_ok = True
+for t in range(6):
+    hm = honest_models(N, 20 + t)
+    models = list(hm)
+    if t % 2 == 0:  # attackers poison only on even rounds, behave on odd rounds
+        for i in [0, 1]:
+            models[i] = sa.poison_state_dict(hm[i], ra.snapshot_state_dict(agg.reference_model), "signflip", 5.0)
+    agg.aggregate(models)
+    if t % 2 == 1 and t >= 3:
+        seen_ok = seen_ok and {0, 1} <= set(agg.rejected_last_round)
+check("repsketch: on-off attackers excluded even in rounds where they behave", seen_ok,
+      f"(last rejected {agg.rejected_last_round}, reputation {agg.last_reputation[:3]})")
+check("repsketch: honest clients keep full reputation", min(agg.last_reputation[2:]) > 0.9,
+      f"(min honest r {min(agg.last_reputation[2:]):.2f})")
+
 # --- torch checks -------------------------------------------------------------
 if HAVE_TORCH:
     tprev = {k: torch.tensor(v, dtype=torch.float32) for k, v in prev.items()}

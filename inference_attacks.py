@@ -158,6 +158,19 @@ def invert_from_sketch(model, sketch, y, lr, shape, iters, tv, seed, h, sgn, k):
     return dummy.detach()
 
 
+def blind_baselines(train, batch, seed):
+    """PSNR an attacker gets WITHOUT seeing anything: an all-black image, and the average
+    training image. Any reconstruction near these numbers has learned nothing."""
+    idx = np.random.default_rng(seed).choice(len(train), batch, replace=False)
+    x, _ = stack(train, idx)
+    mean_img = stack(train, np.random.default_rng(seed + 9).choice(len(train), 2000, replace=False))[0].mean(0)
+    black = float(np.mean([psnr(torch.zeros_like(x[i]), x[i]) for i in range(batch)]))
+    avg = float(np.mean([psnr(mean_img, x[i]) for i in range(batch)]))
+    print(f"  blind baselines (no information): all-black image {black:5.2f} dB | "
+          f"average training image {avg:5.2f} dB", flush=True)
+    return black, avg
+
+
 def attack_sketch_inversion(train, dims, batch, iters, lr, seed):
     """C1 leakage: gradient inversion when the server sees only a k-dim sketch (no DP)."""
     set_seed(seed)
@@ -299,6 +312,7 @@ if __name__ == "__main__":
     ap.add_argument("--sketch-dims", type=int, nargs="+", default=[16, 64, 256, 1024],
                     help="C1: sketch sizes for the sketch-only inversion attack")
     ap.add_argument("--only-sketch", action="store_true", help="run only the sketch leakage attack")
+    ap.add_argument("--skip-mia", action="store_true", help="skip membership inference (attack 2)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--quick", action="store_true", help="tiny settings for a smoke test")
     a = ap.parse_args()
@@ -307,6 +321,8 @@ if __name__ == "__main__":
 
     torch.set_num_threads(max(1, os.cpu_count() or 1))
     train, test = load_data()
+    print(f"\nBlind baselines (batch {a.batch})")
+    blind_black, blind_avg = blind_baselines(train, a.batch, a.seed)
     print(f"\nAttack 3 (C1): gradient inversion from a k-dim sketch only (batch {a.batch}, {a.iters} steps)")
     sk_res = attack_sketch_inversion(train, a.sketch_dims, a.batch, a.iters, lr=0.01, seed=a.seed)
     os.makedirs(OUT, exist_ok=True)
@@ -319,8 +335,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
     print(f"\nAttack 1: gradient inversion (batch {a.batch}, {a.iters} steps, labels known)")
     inv = attack_inversion(train, a.sigmas, a.batch, a.iters, lr=0.01, seed=a.seed)
-    print(f"\nAttack 2: membership inference (shard {a.shard}, {a.epochs} local epochs)")
-    mia = attack_membership(train, test, a.sigmas, a.shard, a.epochs, n_eval=min(a.shard, 500), seed=a.seed)
+    if a.skip_mia:
+        print("\nAttack 2 skipped (--skip-mia)")
+        mia = [(s_, float("nan"), float("nan")) for s_ in a.sigmas]
+    else:
+        print(f"\nAttack 2: membership inference (shard {a.shard}, {a.epochs} local epochs)")
+        mia = attack_membership(train, test, a.sigmas, a.shard, a.epochs, n_eval=min(a.shard, 500), seed=a.seed)
 
     os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, "inference_attacks.csv")
@@ -332,6 +352,8 @@ if __name__ == "__main__":
     for (s, p), (_, au, acc) in zip(inv, mia):
         e = dp_epsilon(s, a.rounds)
         print(f"{s:6g} {('inf' if e == float('inf') else f'{e:.1f}'):>10} {p:8.2f} {au:8.3f} {acc:6.1f}")
+    print(f"\nblind baselines: all-black {blind_black:.2f} dB, average image {blind_avg:.2f} dB")
+    print(f"sketch (C1):     " + ", ".join(f"k={k}: {p:.2f} dB" for k, p in sk_res))
     print(f"\nsaved {path}")
     print("Reading: PSNR high = images recovered; AUC 0.5 = no membership leak; "
           "epsilon small = strong formal privacy.")
