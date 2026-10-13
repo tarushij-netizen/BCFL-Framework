@@ -1,0 +1,4 @@
+round,global_acc,global_loss,rejected,malicious_caught,honest_rejected
+0,19.0300,2.264337,,0,0
+1,41.6700,1.672088,,0,0
+2,53.9500,1.298464,,0,0
