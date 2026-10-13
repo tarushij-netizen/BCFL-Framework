@@ -169,6 +169,11 @@ class Task:
 
         self._eval_model = None
         malicious = set(getattr(self.server, 'malicious', []))
+        ledger = None
+        if self.global_args.get('onchain'):
+            from chainfl.incentive import OnchainIncentives
+            ledger = OnchainIncentives(len(self.client_pool), malicious=malicious,
+                                       epoch_len=self.global_args.get('epoch_len', 5))
         results_path = self.global_args.get('results_csv')
         writer = None
         if results_path:
@@ -192,6 +197,11 @@ class Task:
 
             res = self._evaluate_global(global_model)
             rejected = list(getattr(self.server, 'rejected_last_round', []))
+            if ledger is not None:
+                n = len(self.client_pool)
+                hashes = getattr(self.server, 'last_update_hashes', None) or [None] * n
+                rep = getattr(self.server, 'last_reputation', None) or None
+                ledger.on_round(i, [c for c in range(n) if c not in rejected], hashes, rep)
             caught = len([r for r in rejected if r in malicious])
             honest_rej = len([r for r in rejected if r not in malicious])
             logger.info(f"Global round {i}: test acc {res['acc']:.2f}, loss {res['loss']:.4f}, "
@@ -207,3 +217,5 @@ class Task:
                 f.flush()
         if writer:
             f.close()
+        if ledger is not None:
+            ledger.finish()

@@ -40,6 +40,9 @@ if __name__=="__main__":
                         help="Local DP: clip each honest client's update to this L2 norm")
     parser.add_argument('--dp-sigma', type=float, default=0.0,
                         help="Local DP: Gaussian noise multiplier (noise std = sigma * clip)")
+    parser.add_argument('--onchain', action='store_true',
+                        help="C2: record pseudonymous commitments, verdicts, reputation and rewards on the chain")
+    parser.add_argument('--epoch-len', type=int, default=5, help="C2: rounds per reputation/reward epoch")
     parser.add_argument('--rounds', type=int, default=None, help="Override communication rounds")
     parser.add_argument('--non-iid', action='store_true', help="Dirichlet split")
     parser.add_argument('--alpha', type=float, default=None, help="Dirichlet alpha (smaller = more skewed)")
@@ -62,6 +65,8 @@ if __name__=="__main__":
         global_args['non-iid'] = True
     if args.alpha is not None:
         global_args['alpha'] = args.alpha
+    global_args['onchain'] = args.onchain
+    global_args['epoch_len'] = args.epoch_len
     global_args['backdoor_target'] = args.backdoor_target
     global_args['poison_frac'] = args.poison_frac
     if args.no_client_test:

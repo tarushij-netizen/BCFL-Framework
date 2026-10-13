@@ -19,6 +19,7 @@ What this simulation does and does not do
   measure accuracy and detection; it is not a cryptographic implementation.
 - The sketch itself leaks some information; inference_attacks.py --sketch-dims measures it.
 """
+import hashlib
 import logging
 from collections import OrderedDict
 
@@ -196,6 +197,8 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                 rows = np.linalg.norm(np.hstack([dw, db]), axis=1)
                 prof = rows / (rows.sum() + 1e-12)
             packages.append((masked, count_sketch(u, h, s, self.k), prof))  # sketch + class profile
+        # commitments of what each client uploaded (for the on-chain ledger, C2)
+        self.last_update_hashes = [hashlib.sha256(p[0].tobytes()).digest() for p in packages]
         # server side: sees only packages
         mean_update, accepted, sims, ratios = self._server_round(packages, d, round_seed, n, weights)
         if self.reputation is not None:
