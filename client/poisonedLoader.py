@@ -10,6 +10,25 @@ normally). These match the attacks Leash-FL evaluates:
 """
 DATA_ATTACKS = ("labelflip", "backdoor")
 
+# ----------------------------------------------------------------------------- attack timing
+# One shared schedule for every attacker (data and model attacks). task.py sets the round.
+#   always  : attack every round (default; all earlier results)
+#   onoff   : honest for `period` rounds, attack for `period` rounds, and so on
+#             (round // period odd = attack)  -> tests whether reputation remembers
+#   sleeper : honest for the first `period` rounds (build reputation), then attack every round
+SCHEDULE = {"mode": "always", "period": 5, "round": 0}
+ATTACK_MODES = ("always", "onoff", "sleeper")
+
+
+def attack_on(rnd=None):
+    r = SCHEDULE["round"] if rnd is None else rnd
+    mode, p = SCHEDULE["mode"], max(int(SCHEDULE["period"]), 1)
+    if mode == "onoff":
+        return (r // p) % 2 == 1
+    if mode == "sleeper":
+        return r >= p
+    return True
+
 
 def add_trigger(x, size=3, value=1.0):
     """White size x size square, 1 pixel in from the bottom-right corner. x: (B, C, H, W)."""
@@ -34,8 +53,11 @@ class PoisonedLoader:
         return len(self.loader)
 
     def __iter__(self):
+        on = attack_on()
         for x, y in self.loader:
-            if self.attack == "labelflip":
+            if not on:
+                yield x, y
+            elif self.attack == "labelflip":
                 yield x, (self.num_classes - 1) - y
             else:
                 k = int(round(self.poison_frac * len(y)))

@@ -114,6 +114,10 @@ class Reputation:
     def eligible(self, ids):
         return [i for i in ids if self.get(i) >= self.tau]
 
+    def reset(self, i):
+        """Client i comes back under a brand-new identity (whitewashing): fresh reputation."""
+        self.r.pop(i, None)
+
 
 # ---------------------------------------------------------------------------- aggregator
 class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
@@ -131,6 +135,8 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self.reputation = Reputation(rep_init, rep_beta, rep_tau, rep_penalty) if reputation else None
         self.last_reputation = []
         self.last_head_rejected = []
+        self.last_screen_rejected = []
+        self.last_rep_excluded = []
         self.k = sketch_dim
         self.similarity_threshold = similarity_threshold
         self.magnitude_ratio = magnitude_ratio
@@ -148,6 +154,8 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         update (reputation from earlier rounds); None = plain average."""
         sketches = [p[1] for p in packages]
         accepted, sims, ratios = screen(sketches, self.similarity_threshold, self.magnitude_ratio)
+        self.last_screen_rejected = [i for i in range(n) if i not in accepted]
+        self.last_rep_excluded = []
         self.last_head_rejected = []
         if self.class_check and packages[0][2] is not None:
             P = np.stack([p[2] for p in packages])
@@ -160,7 +168,9 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             accepted = [i for i in accepted if z[i] <= self.class_mad]
         if self.reputation is not None:
             self.reputation.update({i: (i in accepted) for i in range(n)})
-            accepted = self.reputation.eligible(accepted)
+            eligible = self.reputation.eligible(accepted)
+            self.last_rep_excluded = [i for i in accepted if i not in eligible]
+            accepted = eligible
         if not accepted:
             return None, accepted, sims, ratios
         total = server_unmask_sum([p[0] for p in packages], accepted, n, round_seed, d, self.mask_scale)
@@ -210,7 +220,12 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         logger.info(f"[sketchSecAgg] round {self.round}: k={self.k} cos={np.round(sims, 3).tolist()} "
                     f"ratio={np.round(ratios, 2).tolist()} rejected={self.rejected_last_round}")
         if self.rejected_last_round:
-            extra = f" (class-profile check: {self.last_head_rejected})" if self.class_check else ""
+            extra = f" (screen: {self.last_screen_rejected}"
+            if self.class_check:
+                extra += f", class-profile check: {self.last_head_rejected}"
+            if self.reputation is not None:
+                extra += f", low reputation: {self.last_rep_excluded}"
+            extra += ")"
             print(f"[sketchSecAgg] round {self.round}: rejected clients (0-based index) "
                   f"{self.rejected_last_round}{extra}")
 

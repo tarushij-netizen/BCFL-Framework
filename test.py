@@ -43,6 +43,16 @@ if __name__=="__main__":
     parser.add_argument('--onchain', action='store_true',
                         help="C2: record pseudonymous commitments, verdicts, reputation and rewards on the chain")
     parser.add_argument('--epoch-len', type=int, default=5, help="C2: rounds per reputation/reward epoch")
+    parser.add_argument('--reward-tau', type=float, default=0.9,
+                        help="C2: minimum reputation to get rewards (keep above --rep-init so new identities earn nothing at first)")
+    parser.add_argument('--attack-mode', choices=['always', 'onoff', 'sleeper'], default='always',
+                        help="always: attack every round; onoff: alternate honest/attack every --attack-period rounds; "
+                             "sleeper: honest for --attack-period rounds, then attack")
+    parser.add_argument('--attack-period', type=int, default=5)
+    parser.add_argument('--sybil', type=int, default=0,
+                        help="C2: attacker registers this many extra idle accounts (never upload) to farm rewards")
+    parser.add_argument('--whitewash', action='store_true',
+                        help="repsketch: an attacker below --rep-tau re-registers as a new identity (fresh reputation)")
     parser.add_argument('--rounds', type=int, default=None, help="Override communication rounds")
     parser.add_argument('--non-iid', action='store_true', help="Dirichlet split")
     parser.add_argument('--alpha', type=float, default=None, help="Dirichlet alpha (smaller = more skewed)")
@@ -67,6 +77,11 @@ if __name__=="__main__":
         global_args['alpha'] = args.alpha
     global_args['onchain'] = args.onchain
     global_args['epoch_len'] = args.epoch_len
+    global_args['reward_tau'] = args.reward_tau
+    global_args['attack_mode'] = args.attack_mode
+    global_args['attack_period'] = args.attack_period
+    global_args['whitewash'] = args.whitewash
+    global_args['sybil'] = args.sybil
     global_args['backdoor_target'] = args.backdoor_target
     global_args['poison_frac'] = args.poison_frac
     if args.no_client_test:
@@ -99,6 +114,14 @@ if __name__=="__main__":
             name += f"_k{args.sketch_dim}"
             if args.class_check:
                 name += f"_cls{args.class_mad:g}"
+        if args.attack_mode != 'always':
+            name += f"_{args.attack_mode}{args.attack_period}"
+        if args.whitewash:
+            name += "_ww"
+        if args.sybil:
+            name += f"_sybil{args.sybil}"
+        if args.onchain:
+            name += f"_rt{args.reward_tau:g}"
         if args.dp_clip:
             name += f"_dp{args.dp_clip:g}-{args.dp_sigma:g}"
             from server.aggregation_alg.robustAgg import dp_epsilon

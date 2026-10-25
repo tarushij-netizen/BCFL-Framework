@@ -169,22 +169,42 @@ class Task:
 
         self._eval_model = None
         malicious = set(getattr(self.server, 'malicious', []))
+        # attack timing (always / onoff / sleeper), shared by data and model attacks
+        from client.poisonedLoader import SCHEDULE, attack_on
+        SCHEDULE['mode'] = self.global_args.get('attack_mode', 'always')
+        SCHEDULE['period'] = self.global_args.get('attack_period', 5)
+        whitewash = self.global_args.get('whitewash', False)
+        rep_obj = getattr(self.server, 'reputation', None)
+        if whitewash and rep_obj is None:
+            raise ValueError("--whitewash needs --aggregator repsketch (there is no reputation to escape otherwise)")
+        results_path = self.global_args.get('results_csv')
         ledger = None
         if self.global_args.get('onchain'):
             from chainfl.incentive import OnchainIncentives
+            prefix = (results_path[:-4] if results_path and results_path.endswith('.csv') else 'results/run') + '_onchain'
             ledger = OnchainIncentives(len(self.client_pool), malicious=malicious,
-                                       epoch_len=self.global_args.get('epoch_len', 5))
-        results_path = self.global_args.get('results_csv')
+                                       epoch_len=self.global_args.get('epoch_len', 5),
+                                       init_rep=rep_obj.init if rep_obj is not None else 0.75,
+                                       reward_tau=self.global_args.get('reward_tau', 0.9),
+                                       out_prefix=prefix,
+                                       sybil=self.global_args.get('sybil', 0))
+        n_rejoins = 0
+        att_rounds = 0          # rounds in which the attackers attacked
+        att_included = 0        # attacker uploads that went into the model while attacking
+        asr_list = []
         writer = None
         if results_path:
             os.makedirs(os.path.dirname(results_path) or '.', exist_ok=True)
             f = open(results_path, 'w', newline='')
             writer = csv.writer(f)
             writer.writerow(['round', 'global_acc', 'global_loss', 'rejected',
-                             'malicious_caught', 'honest_rejected', 'backdoor_asr'])
+                             'malicious_caught', 'honest_rejected', 'backdoor_asr',
+                             'attack_on', 'malicious_included'])
         client_test = self.global_args.get('client_test', True)
 
         for i in range(self.global_args['communication_round']):
+            SCHEDULE['round'] = i
+            on = bool(malicious) and getattr(self.server, 'attack', 'none') != 'none' and attack_on(i)
             for client in self.client_pool:
                 client.train(epoch = i)
                 if client_test:
@@ -202,20 +222,47 @@ class Task:
                 hashes = getattr(self.server, 'last_update_hashes', None) or [None] * n
                 rep = getattr(self.server, 'last_reputation', None) or None
                 ledger.on_round(i, [c for c in range(n) if c not in rejected], hashes, rep)
+            if whitewash:
+                # an attacker that has been shut out drops its identity and comes back as a new one
+                for m in sorted(malicious):
+                    r_now = rep_obj.get(m)
+                    if r_now < rep_obj.tau:
+                        rep_obj.reset(m)
+                        n_rejoins += 1
+                        if ledger is not None:
+                            ledger.rejoin(m, r_now)
+                        print(f"[whitewash] round {i}: attacker {m} (reputation {r_now:.3f}) re-registers as a new identity")
             caught = len([r for r in rejected if r in malicious])
             honest_rej = len([r for r in rejected if r not in malicious])
+            mal_in = len(malicious) - caught
+            if on:
+                att_rounds += 1
+                att_included += mal_in
+            if res.get('asr') is not None and i >= 3:  # rounds 0-2: untrained model, not an attack effect
+                asr_list.append(res['asr'])
             logger.info(f"Global round {i}: test acc {res['acc']:.2f}, loss {res['loss']:.4f}, "
                         f"rejected {rejected}, malicious caught {caught}/{len(malicious)}, honest rejected {honest_rej}")
             asr = res.get('asr')
             asr_txt = f" | backdoor ASR {asr:6.2f}%" if asr is not None else ""
+            on_txt = "" if self.global_args.get('attack_mode', 'always') == 'always' else (" | ATTACKING" if on else " | attackers honest")
             print(f"round {i:3d} | global test acc {res['acc']:6.2f}% | loss {res['loss']:.4f}{asr_txt} | "
-                  f"rejected {rejected}", flush=True)
+                  f"rejected {rejected}{on_txt}", flush=True)
             if writer:
                 writer.writerow([i, f"{res['acc']:.4f}", f"{res['loss']:.6f}",
                                  ' '.join(map(str, rejected)), caught, honest_rej,
-                                 '' if asr is None else f"{asr:.4f}"])
+                                 '' if asr is None else f"{asr:.4f}", int(on), mal_in])
                 f.flush()
         if writer:
             f.close()
+        extra = {
+            "final_acc": round(res['acc'], 2),
+            "final_asr": None if res.get('asr') is None else round(res['asr'], 2),
+            "max_asr_from_round3": round(max(asr_list), 2) if asr_list else None,
+            "attack_rounds": att_rounds,
+            "attacker_uploads_included_while_attacking": att_included,
+            "attacker_uploads_while_attacking": att_rounds * len(malicious),
+            "whitewash_rejoins": n_rejoins,
+        }
+        print("[summary] " + ", ".join(f"{k} {v}" for k, v in extra.items()))
         if ledger is not None:
-            ledger.finish()
+            ledger.finish(extra)
