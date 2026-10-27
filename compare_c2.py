@@ -22,6 +22,7 @@ for path in sorted(glob.glob(os.path.join(d, "*.csv"))):
     row = {
         "run": name,
         "final_acc": f"{float(data[-1]['global_acc']):.2f}",
+        "acc_last5": f"{sum(float(r['global_acc']) for r in data[-5:]) / len(data[-5:]):.2f}",
         "final_asr": f"{asr[-1]:.2f}" if asr else "-",
         "max_asr_r3+": f"{max(asr_late):.2f}" if asr_late else "-",
         "attack_rounds": len(on),

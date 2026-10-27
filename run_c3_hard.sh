@@ -2,14 +2,18 @@
 # Harder settings where screening alone may miss attackers, to test what reputation (C3) adds.
 # Each case is run WITH reputation (repsketch) and WITHOUT (sketch). No chain needed (faster).
 # ~5 min per run, 10 runs. Skips runs whose result file exists.
-# Usage: bash run_c3_hard.sh [seed] [rounds]
+# Usage: bash run_c3_hard.sh [seed] [rounds] [only]
+#   only = optional text; runs whose label does not contain it are skipped
+#   e.g.  bash run_c3_hard.sh 2 30 noniid_labelflip
 set -e
 SEED=${1:-1}
 ROUNDS=${2:-30}
+ONLY=${3:-}
 OUTDIR=results/c3hard
 mkdir -p $OUTDIR
 run () {  # $1 label, rest = flags
   local LABEL=$1; shift
+  if [ -n "$ONLY" ] && [[ "$LABEL" != *"$ONLY"* ]]; then return; fi
   for AGG in repsketch sketch; do
     local OUT=$OUTDIR/${LABEL}_${AGG}_seed${SEED}.csv
     if [ -f "$OUT" ]; then echo "skip $OUT"; continue; fi
