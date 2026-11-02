@@ -14,13 +14,15 @@ secret shares of those pair seeds) and unmasks ONLY the sum of accepted updates.
 
 What this simulation does and does not do
 - The code is split so the server-side function only ever receives (masked, sketch) pairs.
-- Masks are real-valued Gaussian vectors, not field elements, and seed recovery is
-  simulated (the server is handed the rejected clients' pair seeds). This is enough to
-  measure accuracy and detection; it is not a cryptographic implementation.
+- secagg="sim" (default, as in all earlier runs): masks are real-valued Gaussian vectors and
+  seed recovery is simulated (the server is handed the rejected clients' pair seeds).
+- secagg="dh": the real protocol in secaggDH.py: Diffie-Hellman pair keys, SHAKE-256 masks in
+  Z_2^64, self masks, and Shamir shares to remove a rejected client's masks.
 - The sketch itself leaks some information; inference_attacks.py --sketch-dims measures it.
 """
 import hashlib
 import logging
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -28,6 +30,7 @@ import numpy as np
 from .similarityAgg import (_PoolMixin, _flatten, _float_keys, _to_numpy, cosine_similarity,
                             snapshot_state_dict)
 from ..base.baseAggregator import ServerAggregator
+from .secaggDH import DHSecAggRound
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +126,14 @@ class Reputation:
 class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
     def __init__(self, sketch_dim=64, similarity_threshold=0.1, magnitude_ratio=3.0,
                  mask_scale=100.0, seed=0, reputation=False, rep_init=0.75, rep_beta=0.7, rep_tau=0.6,
-                 rep_penalty=0.5, class_check=False, class_mad=3.0, model=None, args=None):
+                 rep_penalty=0.5, class_check=False, class_mad=3.0, secagg="sim", secagg_threshold=None,
+                 model=None, args=None):
         ServerAggregator.__init__(self, model, args)
+        if secagg not in ("sim", "dh"):
+            raise ValueError(f"secagg must be 'sim' or 'dh', got {secagg!r}")
+        self.secagg = secagg
+        self.secagg_threshold = secagg_threshold
+        self.last_secagg_seconds = 0.0
         # Backdoor signal: each client also reports its "class profile" = the share of its
         # output-layer update that falls on each class row (C numbers, e.g. 10). A backdoor
         # drags the model toward one target class, so the attacker's profile is lopsided.
@@ -149,7 +158,7 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self.last_norm_ratios = []
 
     # ----- the only function that plays the server role
-    def _server_round(self, packages, d, round_seed, n, weights=None):
+    def _server_round(self, packages, d, round_seed, n, weights=None, dh_round=None):
         """weights: public per-client weights the clients already multiplied into their
         update (reputation from earlier rounds); None = plain average."""
         sketches = [p[1] for p in packages]
@@ -173,7 +182,10 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             accepted = eligible
         if not accepted:
             return None, accepted, sims, ratios
-        total = server_unmask_sum([p[0] for p in packages], accepted, n, round_seed, d, self.mask_scale)
+        if dh_round is not None:
+            total = dh_round.server_unmask_sum({i: p[0] for i, p in enumerate(packages)}, accepted)
+        else:
+            total = server_unmask_sum([p[0] for p in packages], accepted, n, round_seed, d, self.mask_scale)
         denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
         return total / denom, accepted, sims, ratios
 
@@ -195,11 +207,16 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         weights = None if self.reputation is None else [self.reputation.get(i) for i in range(n)]
 
         # client side (each client computes its own package from its own update)
+        t0 = time.perf_counter()
+        dh_round = DHSecAggRound(n, d, self.secagg_threshold) if self.secagg == "dh" else None
         packages = []
         for i, m in enumerate(models):
             u = _flatten(m, keys) - ref
-            masked, _ = client_package(u if weights is None else weights[i] * u, i, n, round_seed,
-                                       h, s, self.k, self.mask_scale)
+            x = u if weights is None else weights[i] * u
+            if dh_round is not None:
+                masked = dh_round.client_upload(i, x)
+            else:
+                masked, _ = client_package(x, i, n, round_seed, h, s, self.k, self.mask_scale)
             prof = None
             if self.class_check:
                 dw = (_to_numpy(m[w_key]) - _to_numpy(self.reference_model[w_key])).reshape(n_cls, -1)
@@ -210,7 +227,11 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         # commitments of what each client uploaded (for the on-chain ledger, C2)
         self.last_update_hashes = [hashlib.sha256(p[0].tobytes()).digest() for p in packages]
         # server side: sees only packages
-        mean_update, accepted, sims, ratios = self._server_round(packages, d, round_seed, n, weights)
+        mean_update, accepted, sims, ratios = self._server_round(packages, d, round_seed, n, weights, dh_round)
+        self.last_secagg_seconds = time.perf_counter() - t0
+        if dh_round is not None:
+            logger.info(f"[sketchSecAgg] round {self.round}: DH secure aggregation {self.last_secagg_seconds:.2f}s "
+                        f"(n={n}, d={d}, threshold {dh_round.t})")
         if self.reputation is not None:
             self.last_reputation = [round(self.reputation.get(i), 3) for i in range(n)]
             logger.info(f"[sketchSecAgg] round {self.round}: reputation {self.last_reputation}")

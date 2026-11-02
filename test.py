@@ -29,6 +29,9 @@ if __name__=="__main__":
     parser.add_argument('--mag-ratio', type=float, default=3.0, help="similarity: max norm ratio")
     parser.add_argument('--sketch-dim', type=int, default=64,
                         help="sketch (C1): size of the CountSketch the server screens on")
+    parser.add_argument('--secagg', choices=['sim', 'dh'], default='sim',
+                        help="sketch/repsketch: 'sim' = simulated float masks (earlier runs), "
+                             "'dh' = real secure aggregation (Diffie-Hellman + Shamir shares)")
     parser.add_argument('--class-check', action='store_true',
                         help="sketch/repsketch: also reject clients whose output-layer class profile is an outlier")
     parser.add_argument('--class-mad', type=float, default=3.0, help="class check: robust z-score cut-off")
@@ -94,7 +97,8 @@ if __name__=="__main__":
         elif args.aggregator in ('sketch', 'repsketch'):
             agg_kwargs = {'sketch_dim': args.sketch_dim, 'similarity_threshold': args.sim_threshold,
                           'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0,
-                          'class_check': args.class_check, 'class_mad': args.class_mad}
+                          'class_check': args.class_check, 'class_mad': args.class_mad,
+                          'secagg': args.secagg}
             if args.aggregator == 'repsketch':
                 agg_kwargs.update({'reputation': True, 'rep_init': args.rep_init,
                                    'rep_beta': args.rep_beta, 'rep_tau': args.rep_tau,
@@ -114,6 +118,8 @@ if __name__=="__main__":
             name += f"_k{args.sketch_dim}"
             if args.class_check:
                 name += f"_cls{args.class_mad:g}"
+            if args.secagg == 'dh':
+                name += "_dh"
         if args.attack_mode != 'always':
             name += f"_{args.attack_mode}{args.attack_period}"
         if args.whitewash:

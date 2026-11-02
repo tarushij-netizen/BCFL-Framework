@@ -305,6 +305,52 @@ check("class check on: class-0 attackers rejected, honest kept", run_cls(True) =
 check("class check on, no attackers: nobody rejected", run_cls(True, attackers=0) == [],
       f"(rejected {run_cls(True, attackers=0)})")
 
+# 33-40: C1 with real secure aggregation (Diffie-Hellman + Shamir, secaggDH.py)
+dh = importlib.import_module("server.aggregation_alg.secaggDH")
+sh = dh.shamir_share(123456789, 4, [1, 2, 3, 4, 5, 6])
+check("shamir: any 4 of 6 shares rebuild the secret, 3 do not",
+      dh.shamir_reconstruct({x: sh[x] for x in (2, 3, 5, 6)}) == 123456789
+      and dh.shamir_reconstruct({x: sh[x] for x in (1, 2, 3)}) != 123456789)
+ska, pka = dh.dh_keygen()
+skb, pkb = dh.dh_keygen()
+check("DH: both sides derive the same pair key", dh.dh_agree(ska, pkb) == dh.dh_agree(skb, pka))
+rd = dh.DHSecAggRound(N, D)
+Y = {i: rd.client_upload(i, U[i]) for i in range(N)}
+tot_dh = rd.server_unmask_sum(Y, acc_set)
+check("DH secure agg: unmasked sum over accepted = true sum (rejected 0,1 removed)",
+      np.allclose(tot_dh, np.sum([U[i] for i in acc_set], axis=0), atol=1e-5),
+      f"(max err {np.abs(tot_dh - np.sum([U[i] for i in acc_set], axis=0)).max():.1e})")
+single = dh.decode(Y[0])
+corr = abs(np.corrcoef(single, U[0])[0, 1])
+check("DH secure agg: a single upload is uniform noise in Z_2^64 (no correlation with update)",
+      corr < 5 / np.sqrt(D) and np.abs(single).mean() > 1e9, f"(|corr| {corr:.3f})")
+try:
+    rd.holder_reveal(5, "sk", 2)        # holder 5 already revealed b of accepted client 2
+    refused = False
+except PermissionError:
+    refused = True
+check("DH secure agg: a holder never reveals both secrets of one client", refused)
+rd2 = dh.DHSecAggRound(N, D)
+Y2 = {i: rd2.client_upload(i, U[i]) for i in range(N)}
+try:
+    rd2.server_unmask_sum(Y2, acc_set, holders=[2, 3, 4])
+    aborted = False
+except RuntimeError:
+    aborted = True
+check("DH secure agg: aborts with fewer than t share holders", aborted)
+for attack in ["signflip", "noise"]:
+    SKD = ra.make_server_class("sketch", attack, malicious=[0, 1], seed=0,
+                               agg_kwargs={"sketch_dim": 64, "secagg": "dh"})
+    srvd = SKD()
+    srvd.set_global_model(prev)
+    hm = honest_models(N, 13)
+    srvd.receive_upload([FakeClient(x) for x in hm])
+    outd = srvd.aggregate()
+    honest_mean = np.mean([flat(m) for m in hm[2:]], axis=0)
+    check(f"sketch aggregator, secagg=dh ({attack}): rejects 0,1 only, result = honest mean",
+          srvd.rejected_last_round == [0, 1] and np.allclose(flat(outd), honest_mean, atol=1e-5),
+          f"(rejected={srvd.rejected_last_round}, {srvd.last_secagg_seconds:.2f}s)")
+
 # --- torch checks -------------------------------------------------------------
 if HAVE_TORCH:
     tprev = {k: torch.tensor(v, dtype=torch.float32) for k, v in prev.items()}
