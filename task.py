@@ -187,7 +187,10 @@ class Task:
                                        init_rep=rep_obj.init if rep_obj is not None else 0.75,
                                        reward_tau=self.global_args.get('reward_tau', 0.9),
                                        out_prefix=prefix,
-                                       sybil=self.global_args.get('sybil', 0))
+                                       sybil=self.global_args.get('sybil', 0),
+                                       rep_params=None if rep_obj is None else dict(
+                                           init=rep_obj.init, beta=rep_obj.beta,
+                                           tau=rep_obj.tau, penalty=rep_obj.penalty))
         n_rejoins = 0
         att_rounds = 0          # rounds in which the attackers attacked
         att_included = 0        # attacker uploads that went into the model while attacking
@@ -221,7 +224,11 @@ class Task:
                 n = len(self.client_pool)
                 hashes = getattr(self.server, 'last_update_hashes', None) or [None] * n
                 rep = getattr(self.server, 'last_reputation', None) or None
-                ledger.on_round(i, [c for c in range(n) if c not in rejected], hashes, rep)
+                # verdict on chain = passed screening (the reputation rule's input); falls back
+                # to "included" for aggregators without separate screening lists
+                screened_out = set(getattr(self.server, 'last_screen_rejected', rejected)) | \
+                    set(getattr(self.server, 'last_head_rejected', []))
+                ledger.on_round(i, [c for c in range(n) if c not in screened_out], hashes, rep)
             if whitewash:
                 # an attacker that has been shut out drops its identity and comes back as a new one
                 for m in sorted(malicious):

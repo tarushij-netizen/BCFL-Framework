@@ -22,11 +22,20 @@ threshold above init_rep they earn nothing and the attacker only loses the stake
 Whitewashing (rejoin): an attacker whose reputation fell can drop its account and register a
 new one (fresh secrets, fresh payout address, new stake). `rejoin(i)` simulates that.
 
+Pseudonym -> account link (linkEscrow.py, 2 Nov): each client escrows its link secret s2 to
+the committee as t-of-n Shamir shares, encrypted to each member with Diffie-Hellman. The
+server never holds it. At each epoch, t members open the escrow, map the posted pseudonyms to
+accounts and recompute every account's reputation from the posted verdicts with the public
+reputation rule; that committee-computed list is what goes on chain. The aggregator's own
+reputation is only used as a cross-check (a mismatch is printed).
+
+Verdicts posted per round = "passed screening" (sketch + class check), the input of the
+reputation rule. Who was finally averaged in also depends on reputation, which is public.
+
 Simulation notes (state these in the paper):
-- The pseudonym -> account link is held here in one Python dict standing in for the committee.
-  In the design it is secret-shared among the n members; that part is not implemented.
-- Reputation values come from the aggregator's own reputation (repsketch). The committee
-  would recompute them from the posted verdicts with the same rule.
+- `self.owned` plays the clients' wallets (they keep s1, s2 and compute their own pseudonyms);
+  the escrow boxes and the verdict log are kept in memory instead of being read from the chain.
+- The t members that open an epoch learn the links: trust assumption "no t members collude".
 """
 import csv
 import os
@@ -36,6 +45,8 @@ from chainfl.interact import chain_proxy  # noqa: F401  (connects to the chain, 
 from brownie import accounts, web3
 from brownie.project.chainServer import ReputationLedger
 
+from chainfl.linkEscrow import Committee, escrow
+
 
 def _keccak(*parts):
     return web3.keccak(b"".join(parts))
@@ -44,7 +55,7 @@ def _keccak(*parts):
 class OnchainIncentives:
     def __init__(self, n_clients, malicious=(), n_committee=5, threshold=3, epoch_len=5,
                  init_rep=0.75, reward_tau=0.9, reward_wei=10 ** 18, stake_wei=10 ** 16,
-                 out_prefix="results/onchain", sybil=0):
+                 out_prefix="results/onchain", sybil=0, rep_params=None):
         self.n = n_clients
         self.malicious = set(malicious)
         self.epoch_len = epoch_len
@@ -56,6 +67,13 @@ class OnchainIncentives:
         for m in self.committee:
             self.server.transfer(m, "1 ether", silent=True)
         self.gas = {}
+        # off-chain side of the committee: one DH key pair per member (member j <-> committee[j])
+        self.escrow = Committee(n_committee, threshold)
+        self.rep_params = dict(init=init_rep, beta=0.7, tau=0.6, penalty=0.5)
+        self.rep_params.update(rep_params or {})
+        self.verdict_log = []            # (round, pseudonyms, passed-screening flags) as posted
+        self.next_round = 0
+        self.rep_mismatch = 0
         self.ledger = ReputationLedger.deploy([m.address for m in self.committee], threshold,
                                               int(init_rep * 1000), int(reward_tau * 1000), stake_wei,
                                               {"from": self.server, "silent": True})
@@ -94,6 +112,9 @@ class OnchainIncentives:
                                   {"from": payout, "value": self.stake_wei, "silent": True})
         self._gas("register (per account)", tx)
         self.owned[i].append(acc)
+        # the client escrows its link secret to the committee; the server never sees it
+        self.escrow.add_box(escrow(acc["id"], s2, self.escrow.public_keys, self.escrow.t),
+                            first_round=self.next_round)
 
     def cur(self, i):
         return self.owned[i][-1]
@@ -109,40 +130,54 @@ class OnchainIncentives:
     def _gas(self, name, tx):
         self.gas.setdefault(name, []).append(tx.gas_used)
 
-    def pseudonym(self, i, rnd):
-        return _keccak(self.cur(i)["s2"], rnd.to_bytes(32, "big"))
+    @staticmethod
+    def _pseudonym_of(s2, rnd):
+        return _keccak(s2, rnd.to_bytes(32, "big"))
 
-    def on_round(self, rnd, included, update_hashes, reputation=None):
-        """included: client indices whose update went into the aggregate.
-        reputation: per-client reputation in [0, 1] from the aggregator (None = keep)."""
+    def pseudonym(self, i, rnd):
+        """Computed by client i from its own s2 (client side)."""
+        return self._pseudonym_of(self.cur(i)["s2"], rnd)
+
+    def on_round(self, rnd, passed, update_hashes, reputation=None):
+        """passed: client indices whose update passed screening this round.
+        reputation: per-client reputation in [0, 1] from the aggregator, used only to
+        cross-check the committee's own tally (None = do not close epochs)."""
         ps = [self.pseudonym(i, rnd) for i in range(self.n)]
         hs = [h if h is not None else bytes(32) for h in update_hashes]
         self._gas(f"recordRound ({self.n} clients)",
                   self.ledger.recordRound(rnd, ps, hs, {"from": self.server, "silent": True}))
-        flags = [i in included for i in range(self.n)]
+        flags = [i in passed for i in range(self.n)]
         self._gas(f"postVerdicts ({self.n} clients)",
                   self.ledger.postVerdicts(rnd, ps, flags, {"from": self.server, "silent": True}))
+        self.verdict_log.append((rnd, ps, flags))
+        self.next_round = rnd + 1
         if reputation is not None and (rnd + 1) % self.epoch_len == 0:
             self._close_epoch(reputation)
 
     def _close_epoch(self, reputation):
-        """Committee update: only accounts whose reputation changed are sent (an abandoned
-        account once, idle Sybil accounts never), so gas does not grow with dead accounts."""
+        """Committee update: t members open the link escrow and recompute every account's
+        reputation from the posted verdicts. Only accounts whose reputation changed are sent
+        (an abandoned account once, idle Sybil accounts never), so gas does not grow with dead
+        accounts."""
+        from server.aggregation_alg.sketchSecAgg import Reputation
+        k = self.ledger.threshold()
+        links = self.escrow.open_links(range(k))
+        tally = self.escrow.tally(links, self.verdict_log, self._pseudonym_of, Reputation(**self.rep_params))
+        to_int = lambda r: max(0, min(1000, int(round(r * 1000))))
+        bad = [i for i in range(self.n) if abs(to_int(tally[self.cur(i)["id"]]) - to_int(reputation[i])) > 1]
+        if bad:
+            self.rep_mismatch += len(bad)
+            print(f"[C2] warning: committee tally differs from the aggregator's reputation for clients {bad}")
         ids, new = [], []
-        for i in range(self.n):
-            for acc in self.owned[i]:
-                if acc is self.cur(i):
-                    v = max(0, min(1000, int(round(reputation[i] * 1000))))
-                else:
-                    v = self.frozen[acc["id"]]
-                if self.onchain_rep.get(acc["id"], self.init_rep_int) != v:
-                    ids.append(acc["id"])
-                    new.append(v)
+        for box in self.escrow.boxes:
+            v = to_int(tally[box["id"]])
+            if self.onchain_rep.get(box["id"], self.init_rep_int) != v:
+                ids.append(box["id"])
+                new.append(v)
         if not ids:  # nothing changed; the contract still needs an applied proposal to pay out
             ids, new = [self.cur(0)["id"]], [self.onchain_rep.get(self.cur(0)["id"], self.init_rep_int)]
         members = self.committee
         self._gas("proposeEpoch", self.ledger.proposeEpoch(self.epoch, ids, new, {"from": members[0], "silent": True}))
-        k = self.ledger.threshold()
         for m in members[1:k]:
             self._gas("approveEpoch", self.ledger.approveEpoch(self.epoch, ids, new, {"from": m, "silent": True}))
         self._gas("distribute", self.ledger.distribute(self.epoch, {"from": self.server, "value": self.reward_wei, "silent": True}))
@@ -190,6 +225,7 @@ class OnchainIncentives:
             "sybil_accounts": len(self.sybils),
             "sybil_reward_share": round(sybil_reward / total, 4),
             "epochs": len(self.history),
+            "committee_tally_mismatches": self.rep_mismatch,
         }
         summary.update(extra or {})
         with open(self.out_prefix + "_summary.csv", "w", newline="") as f:

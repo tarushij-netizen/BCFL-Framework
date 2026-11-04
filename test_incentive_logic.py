@@ -1,6 +1,6 @@
 """Checks the C2 incentive logic (attack timing, Sybil accounts, whitewashing, reward split)
 WITHOUT a blockchain: brownie and the contract are replaced by a small Python stand-in that
-follows ReputationLedger.sol. Run: python test_incentive_logic.py  (expects 10/10)."""
+follows ReputationLedger.sol. Run: python test_incentive_logic.py  (expects 16/16)."""
 import os, sys, types, hashlib, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -96,4 +96,32 @@ check(min(hon) > 0 and max(hon) - min(hon) <= 1, "honest clients paid equally at
 import csv
 row = list(csv.DictReader(open(os.path.join(OUT, "rt0.9_ww0_summary.csv"))))[0]
 check(row["attacker_reward_share"] == "0.0" and row["x"] == "1", "summary CSV written")
+check(all(int(list(csv.DictReader(open(os.path.join(OUT, f))))[0]["committee_tally_mismatches"]) == 0
+          for f in os.listdir(OUT) if f.endswith("_summary.csv")),
+      "committee tally from escrowed links = aggregator reputation in every run (whitewash too)")
+
+# link escrow (linkEscrow.py): t-of-n, encrypted shares, nothing for the server
+from chainfl.linkEscrow import Committee, escrow
+E = Committee(5, 3)
+s2s = [os.urandom(32) for _ in range(4)]
+for j, s2 in enumerate(s2s):
+    E.add_box(escrow(b"acct%d" % j, s2, E.public_keys, 3), first_round=0)
+check(E.open_links([0, 2, 4]) == {b"acct%d" % j: s2s[j] for j in range(4)}, "any 3 of 5 members recover every link")
+try:
+    E.open_links([1, 3]); two = True
+except PermissionError:
+    two = False
+check(not two, "2 of 5 members cannot open the links")
+box = E.boxes[0]
+check(all(s2s[0] not in ct and len(ct) == 66 for ct in box["ciphertexts"]) and s2s[0] not in str(box).encode(),
+      "an escrow box (all the server relays) does not contain the link")
+E.boxes[1]["ciphertexts"][2] = bytes(66)
+try:
+    E.open_links([0, 1, 2]); caught = False
+except ValueError:
+    caught = True
+check(caught, "a corrupted share is detected when the committee opens the escrow")
+L = sim(0.9, False, rounds=5)
+check("s2" not in str(vars(L.escrow)) and all(isinstance(b["tag"], bytes) for b in L.escrow.boxes),
+      "ledger run: committee side holds only boxes, member keys and tags")
 print(f"{ok}/{ok} mock checks passed")
