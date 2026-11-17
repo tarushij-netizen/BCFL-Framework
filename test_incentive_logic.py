@@ -101,11 +101,12 @@ check(all(int(list(csv.DictReader(open(os.path.join(OUT, f))))[0]["committee_tal
       "committee tally from escrowed links = aggregator reputation in every run (whitewash too)")
 
 # link escrow (linkEscrow.py): t-of-n, encrypted shares, nothing for the server
-from chainfl.linkEscrow import Committee, escrow
+from chainfl.linkEscrow import Committee, complaint_is_valid, escrow
+import chainfl.linkEscrow as LE
 E = Committee(5, 3)
 s2s = [os.urandom(32) for _ in range(4)]
 for j, s2 in enumerate(s2s):
-    E.add_box(escrow(b"acct%d" % j, s2, E.public_keys, 3), first_round=0)
+    assert E.add_box(escrow(b"acct%d" % j, s2, E.public_keys, 3), first_round=0) == []
 check(E.open_links([0, 2, 4]) == {b"acct%d" % j: s2s[j] for j in range(4)}, "any 3 of 5 members recover every link")
 try:
     E.open_links([1, 3]); two = True
@@ -113,14 +114,33 @@ except PermissionError:
     two = False
 check(not two, "2 of 5 members cannot open the links")
 box = E.boxes[0]
-check(all(s2s[0] not in ct and len(ct) == 66 for ct in box["ciphertexts"]) and s2s[0] not in str(box).encode(),
+check(all(s2s[0] not in ct and len(ct) == LE.SHARE_BYTES for ct in box["ciphertexts"]) and s2s[0] not in str(box).encode(),
       "an escrow box (all the server relays) does not contain the link")
-E.boxes[1]["ciphertexts"][2] = bytes(66)
+E.boxes[1]["ciphertexts"][2] = bytes(LE.SHARE_BYTES)
 try:
     E.open_links([0, 1, 2]); caught = False
 except ValueError:
     caught = True
 check(caught, "a corrupted share is detected when the committee opens the escrow")
+check(E.open_links([0, 1, 2, 3])[b"acct1"] == s2s[1],
+      "VSS: the bad share is skipped and any 3 valid shares still open the link")
+# a cheating client: share for member 4 is off the committed polynomial
+s2c = os.urandom(32)
+bad = escrow(b"cheat", s2c, E.public_keys, 3)
+y4 = E.members[3].decrypt_share(bad)[1]
+ks = LE._keystream(LE.dh_agree(E.members[3]._sk, bad["eph_pk"]), LE.SHARE_BYTES)
+bad["ciphertexts"][3] = LE._xor(((y4 + 1) % LE.Q).to_bytes(LE.SHARE_BYTES, "big"), ks)
+nb = len(E.boxes)
+comp = E.add_box(bad, first_round=0)
+check(len(comp) == 1 and comp[0]["member"] == 4 and len(E.boxes) == nb,
+      "VSS: a client sending a bad share is identified by a verifiable complaint and its box refused")
+good = escrow(b"honest", os.urandom(32), E.public_keys, 3)
+Kg, pg = LE.dleq_prove(E.members[3]._sk, good["eph_pk"])     # member 4 complains about a good box
+check(E.members[3].check_box(good) is None and
+      not complaint_is_valid(good, E.members[3].pk, {"member": 4, "K": Kg, "proof": pg}),
+      "VSS: a member cannot frame an honest client (false complaint fails the public check)")
+check(not complaint_is_valid(bad, E.members[2].pk, dict(comp[0], member=3)),
+      "VSS: a complaint with someone else's proof is rejected")
 L = sim(0.9, False, rounds=5)
 check("s2" not in str(vars(L.escrow)) and all(isinstance(b["tag"], bytes) for b in L.escrow.boxes),
       "ledger run: committee side holds only boxes, member keys and tags")

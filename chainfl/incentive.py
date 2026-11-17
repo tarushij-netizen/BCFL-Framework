@@ -22,8 +22,9 @@ threshold above init_rep they earn nothing and the attacker only loses the stake
 Whitewashing (rejoin): an attacker whose reputation fell can drop its account and register a
 new one (fresh secrets, fresh payout address, new stake). `rejoin(i)` simulates that.
 
-Pseudonym -> account link (linkEscrow.py, 2 Nov): each client escrows its link secret s2 to
-the committee as t-of-n Shamir shares, encrypted to each member with Diffie-Hellman. The
+Pseudonym -> account link (linkEscrow.py, 2 Nov; verifiable shares 5 Nov): each client escrows
+its link secret s2 to the committee as t-of-n Feldman VSS shares (members check their share at
+registration), encrypted to each member with Diffie-Hellman. The
 server never holds it. At each epoch, t members open the escrow, map the posted pseudonyms to
 accounts and recompute every account's reputation from the posted verdicts with the public
 reputation rule; that committee-computed list is what goes on chain. The aggregator's own
@@ -113,8 +114,11 @@ class OnchainIncentives:
         self._gas("register (per account)", tx)
         self.owned[i].append(acc)
         # the client escrows its link secret to the committee; the server never sees it
-        self.escrow.add_box(escrow(acc["id"], s2, self.escrow.public_keys, self.escrow.t),
-                            first_round=self.next_round)
+        complaints = self.escrow.add_box(escrow(acc["id"], s2, self.escrow.public_keys, self.escrow.t),
+                                         first_round=self.next_round)
+        if complaints:   # every member verifies its share (Feldman VSS); honest clients never hit this
+            raise RuntimeError(f"client {i}: escrow refused, members {[c['member'] for c in complaints]} "
+                               f"proved their shares invalid")
 
     def cur(self, i):
         return self.owned[i][-1]
