@@ -191,6 +191,13 @@ class Task:
                                        rep_params=None if rep_obj is None else dict(
                                            init=rep_obj.init, beta=rep_obj.beta,
                                            tau=rep_obj.tau, penalty=rep_obj.penalty))
+        if ledger is not None and getattr(self.server, 'secagg', None) == 'hardened':
+            # hardened C1: the ledger is the round's bulletin board and its committee the beacon
+            from chainfl.chainboard import ChainBoard
+            from chainfl.beacon import BeaconCommittee
+            self.server.board = ChainBoard(ledger)
+            self.server.beacon = BeaconCommittee(self.server.board, n=len(ledger.committee),
+                                                 t=ledger.ledger.threshold())
         n_rejoins = 0
         att_rounds = 0          # rounds in which the attackers attacked
         att_included = 0        # attacker uploads that went into the model while attacking
@@ -215,6 +222,9 @@ class Task:
                 client.sign_test(epoch = i)
             self.server.receive_upload(self.client_pool)
             global_model = self.server.aggregate()
+            board = getattr(self.server, 'board', None)
+            if board is not None and hasattr(board, 'audit'):
+                board.audit(i)          # this round's beacon log agrees with the chain
             for client in self.client_pool:
                 client.load_state_dict(global_model)
 
@@ -234,7 +244,10 @@ class Task:
                 for m in sorted(malicious):
                     r_now = rep_obj.get(m)
                     if r_now < rep_obj.tau:
-                        rep_obj.reset(m)
+                        if hasattr(self.server, 'forget_client'):
+                            self.server.forget_client(m)    # fresh reputation, probation, collusion history
+                        else:
+                            rep_obj.reset(m)
                         n_rejoins += 1
                         if ledger is not None:
                             ledger.rejoin(m, r_now)

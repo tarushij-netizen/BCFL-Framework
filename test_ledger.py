@@ -91,4 +91,30 @@ before = payout[0].balance()
 L.claim({"from": payout[0], "silent": True})
 check("claim pays the payout address", payout[0].balance() > before and L.claimable(payout[0].address) == 0)
 
+# ---- hardened C1 (Phase 1): the beacon's phase rules on chain
+R = 7
+L.postDeal(R, b"\x01" * 40, {"from": committee[0], "silent": True})
+check("a member can post a beacon deal while the round is open",
+      hx(L.dealHash(R, committee[0].address)) == hx(web3.keccak(b"\x01" * 40)))
+with reverts("already dealt") as rv:
+    L.postDeal(R, b"\x02" * 40, {"from": committee[0], "silent": True})
+check("one deal per member per round", rv.ok, f"({rv.detail})")
+with reverts("only committee") as rv:
+    L.postDeal(R, b"\x03" * 40, {"from": payout[0], "silent": True})
+check("non-members cannot deal", rv.ok, f"({rv.detail})")
+with reverts("round open") as rv:
+    L.postReveal(R, b"\x05" * 32, {"from": committee[0], "silent": True})
+check("no reveal while uploads can still change", rv.ok, f"({rv.detail})")
+psR = [web3.keccak(text=f"pseudo-{i}-r{R}") for i in range(4)]
+L.recordRound(R, psR, hs, {"from": server, "silent": True})
+check("recordRound closes the round", L.roundClosed(R))
+with reverts("round closed") as rv:
+    L.postDeal(R, b"\x04" * 40, {"from": committee[1], "silent": True})
+check("no deal after the uploads are fixed", rv.ok, f"({rv.detail})")
+L.postReveal(R, b"\x05" * 32, {"from": committee[0], "silent": True})
+check("the dealer reveals after the round is closed", hx(L.revealOf(R, committee[0].address)) == hx(b"\x05" * 32))
+with reverts("no deal") as rv:
+    L.postReveal(R, b"\x06" * 32, {"from": committee[1], "silent": True})
+check("a member that did not deal cannot reveal", rv.ok, f"({rv.detail})")
+
 print(f"\n{passed}/{total} checks passed")

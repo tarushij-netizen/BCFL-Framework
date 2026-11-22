@@ -1,0 +1,14 @@
+[package]
+name = "bcfl_crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Ristretto255 group operations for the BCFL thesis (Feldman VSS, beacon, commitments)"
+license = "MIT"
+
+[lib]
+name = "bcfl_crypto"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }

@@ -73,6 +73,7 @@ class OnchainIncentives:
         self.rep_params = dict(init=init_rep, beta=0.7, tau=0.6, penalty=0.5)
         self.rep_params.update(rep_params or {})
         self.verdict_log = []            # (round, pseudonyms, passed-screening flags) as posted
+        self.recorded = set()            # rounds whose upload commitments are already on chain
         self.next_round = 0
         self.rep_mismatch = 0
         self.ledger = ReputationLedger.deploy([m.address for m in self.committee], threshold,
@@ -142,14 +143,22 @@ class OnchainIncentives:
         """Computed by client i from its own s2 (client side)."""
         return self._pseudonym_of(self.cur(i)["s2"], rnd)
 
+    def record_commitments(self, rnd, update_hashes):
+        """Post every client's upload commitment under its round pseudonym (recordRound). In the
+        hardened C1 round this happens BEFORE the beacon reveal and closes the round on chain."""
+        ps = [self.pseudonym(i, rnd) for i in range(self.n)]
+        hs = [h if h is not None else bytes(32) for h in update_hashes]
+        self._gas(f"recordRound ({self.n} clients)",
+                  self.ledger.recordRound(rnd, ps, hs, {"from": self.server, "silent": True}))
+        self.recorded.add(rnd)
+
     def on_round(self, rnd, passed, update_hashes, reputation=None):
         """passed: client indices whose update passed screening this round.
         reputation: per-client reputation in [0, 1] from the aggregator, used only to
         cross-check the committee's own tally (None = do not close epochs)."""
         ps = [self.pseudonym(i, rnd) for i in range(self.n)]
-        hs = [h if h is not None else bytes(32) for h in update_hashes]
-        self._gas(f"recordRound ({self.n} clients)",
-                  self.ledger.recordRound(rnd, ps, hs, {"from": self.server, "silent": True}))
+        if rnd not in self.recorded:     # legacy rounds record commitments here, after the fact
+            self.record_commitments(rnd, update_hashes)
         flags = [i in passed for i in range(self.n)]
         self._gas(f"postVerdicts ({self.n} clients)",
                   self.ledger.postVerdicts(rnd, ps, flags, {"from": self.server, "silent": True}))

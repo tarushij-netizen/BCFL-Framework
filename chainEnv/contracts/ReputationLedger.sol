@@ -19,6 +19,15 @@ pragma solidity ^0.8.0;
  *                    above `tau`. New accounts start at `initRep` (< tau) and must earn trust, so
  *                    making many fake identities (Sybil) earns nothing at first and costs `stake` each.
  * Reputation is an integer in [0, 1000] (1000 = 1.0).
+ *
+ * Hardened C1 (Phase 1): this contract is also the round's bulletin board.
+ *   - recordRound fixes the round's upload commitments and CLOSES the round.
+ *   - While a round is open, committee members post beacon deals (Feldman commitments + shares
+ *     encrypted to each member), complaints, and answers to complaints.
+ *   - Only after it is closed may members post beacon reveals and reconstruction shares, so the
+ *     round's sketch seed cannot exist while any upload can still change.
+ * Deal data travels in events (calldata), with only its hash in storage; group checks
+ * (Ristretto255) are done off chain by every reader, from the same public data.
  */
 contract ReputationLedger {
     address public server;
@@ -53,6 +62,11 @@ contract ReputationLedger {
     mapping(address => uint256) public claimable;
     uint256 public totalDistributed;
 
+    // hardened C1 beacon (Phase 1)
+    mapping(uint256 => bool) public roundClosed;
+    mapping(uint256 => mapping(address => bytes32)) public dealHash;
+    mapping(uint256 => mapping(address => bytes32)) public revealOf;
+
     event Registered(bytes32 indexed id, address payout);
     event RoundRecorded(uint256 indexed round, uint256 n);
     event VerdictsPosted(uint256 indexed round, uint256 accepted, uint256 rejected);
@@ -60,6 +74,12 @@ contract ReputationLedger {
     event EpochApplied(uint256 indexed epoch, uint256 nAccounts);
     event RewardsDistributed(uint256 indexed epoch, uint256 amount, uint256 eligible);
     event Claimed(address indexed payout, uint256 amount);
+    event BeaconDeal(uint256 indexed round, address indexed dealer, bytes data);
+    event BeaconComplaint(uint256 indexed round, address indexed member, address indexed dealer);
+    event BeaconAnswer(uint256 indexed round, address indexed dealer, address indexed member, bytes32 share);
+    event BeaconReveal(uint256 indexed round, address indexed dealer, bytes32 secret);
+    event BeaconRecon(uint256 indexed round, address indexed member, address indexed dealer, bytes32 share);
+    event RoundOutcome(uint256 indexed round, bool sumCheck);
 
     modifier onlyServer() {
         require(msg.sender == server, "only server");
@@ -110,6 +130,7 @@ contract ReputationLedger {
             require(updateHash[round][pseudonyms[i]] == bytes32(0), "pseudonym reused");
             updateHash[round][pseudonyms[i]] = hashes[i];
         }
+        roundClosed[round] = true;  // uploads are fixed from here on
         emit RoundRecorded(round, pseudonyms.length);
     }
 
@@ -123,6 +144,46 @@ contract ReputationLedger {
             if (accepted[i]) nAcc++;
         }
         emit VerdictsPosted(round, nAcc, pseudonyms.length - nAcc);
+    }
+
+    // ------------------------------------------------------------------ beacon (hardened C1)
+    function postDeal(uint256 round, bytes calldata data) external onlyMember {
+        require(!roundClosed[round], "round closed");
+        require(dealHash[round][msg.sender] == bytes32(0), "already dealt");
+        require(data.length > 0, "empty deal");
+        dealHash[round][msg.sender] = keccak256(data);
+        emit BeaconDeal(round, msg.sender, data);
+    }
+
+    function postComplaint(uint256 round, address dealer) external onlyMember {
+        require(!roundClosed[round], "round closed");
+        require(dealHash[round][dealer] != bytes32(0), "no deal");
+        emit BeaconComplaint(round, msg.sender, dealer);
+    }
+
+    function answerComplaint(uint256 round, address member, bytes32 share) external onlyMember {
+        require(!roundClosed[round], "round closed");
+        require(dealHash[round][msg.sender] != bytes32(0), "no deal");
+        emit BeaconAnswer(round, msg.sender, member, share);
+    }
+
+    function postReveal(uint256 round, bytes32 secret) external onlyMember {
+        require(roundClosed[round], "round open");
+        require(dealHash[round][msg.sender] != bytes32(0), "no deal");
+        require(revealOf[round][msg.sender] == bytes32(0), "already revealed");
+        revealOf[round][msg.sender] = secret;
+        emit BeaconReveal(round, msg.sender, secret);
+    }
+
+    function postReconShare(uint256 round, address dealer, bytes32 share) external onlyMember {
+        require(roundClosed[round], "round open");
+        require(dealHash[round][dealer] != bytes32(0), "no deal");
+        emit BeaconRecon(round, msg.sender, dealer, share);
+    }
+
+    function postOutcome(uint256 round, bool sumCheck) external onlyServer {
+        require(roundClosed[round], "round open");
+        emit RoundOutcome(round, sumCheck);
     }
 
     // ------------------------------------------------------------------ per epoch (k-of-n)

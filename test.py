@@ -29,12 +29,21 @@ if __name__=="__main__":
     parser.add_argument('--mag-ratio', type=float, default=3.0, help="similarity: max norm ratio")
     parser.add_argument('--sketch-dim', type=int, default=64,
                         help="sketch (C1): size of the CountSketch the server screens on")
-    parser.add_argument('--secagg', choices=['sim', 'dh'], default='sim',
+    parser.add_argument('--secagg', choices=['sim', 'dh', 'hardened'], default='sim',
                         help="sketch/repsketch: 'sim' = simulated float masks (earlier runs), "
-                             "'dh' = real secure aggregation (Diffie-Hellman + Shamir shares)")
+                             "'dh' = real secure aggregation (Diffie-Hellman + Shamir shares), "
+                             "'hardened' = Phase 1: field masks, commit-first uploads, committee "
+                             "beacon sketch seed, sum check")
+    parser.add_argument('--c1-attack', choices=['none', 'sketchlie', 'nullspace'], default='none',
+                        help="test attacker against C1 itself (needs --attack signflip): 'sketchlie' = "
+                             "benign sketch + poisoned upload; 'nullspace' = poison the expected sketch cannot see")
     parser.add_argument('--class-check', action='store_true',
                         help="sketch/repsketch: also reject clients whose output-layer class profile is an outlier")
     parser.add_argument('--class-mad', type=float, default=3.0, help="class check: robust z-score cut-off")
+    parser.add_argument('--probation', type=int, default=0,
+                        help="repsketch: rounds a re-registered identity stays out of aggregation (whitewashing fix)")
+    parser.add_argument('--collusion-check', action='store_true',
+                        help="sketch/repsketch: reject groups of >= 3 clients that push the same direction round after round")
     parser.add_argument('--rep-init', type=float, default=0.75, help="repsketch (C3): starting reputation")
     parser.add_argument('--rep-beta', type=float, default=0.7, help="repsketch: memory (higher = slower change)")
     parser.add_argument('--rep-tau', type=float, default=0.6, help="repsketch: minimum reputation to take part")
@@ -98,11 +107,12 @@ if __name__=="__main__":
             agg_kwargs = {'sketch_dim': args.sketch_dim, 'similarity_threshold': args.sim_threshold,
                           'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0,
                           'class_check': args.class_check, 'class_mad': args.class_mad,
-                          'secagg': args.secagg}
+                          'secagg': args.secagg, 'c1_attack': args.c1_attack,
+                          'collusion_check': args.collusion_check}
             if args.aggregator == 'repsketch':
                 agg_kwargs.update({'reputation': True, 'rep_init': args.rep_init,
                                    'rep_beta': args.rep_beta, 'rep_tau': args.rep_tau,
-                                   'rep_penalty': args.rep_penalty})
+                                   'rep_penalty': args.rep_penalty, 'probation': args.probation})
         elif args.aggregator == 'krum':
             agg_kwargs = {'num_byzantine': max(args.num_malicious, 1)}
         algorithm = RobustFL(aggregator=args.aggregator,
@@ -118,8 +128,14 @@ if __name__=="__main__":
             name += f"_k{args.sketch_dim}"
             if args.class_check:
                 name += f"_cls{args.class_mad:g}"
-            if args.secagg == 'dh':
-                name += "_dh"
+            if args.secagg in ('dh', 'hardened'):
+                name += "_dh" if args.secagg == 'dh' else "_hard"
+            if args.collusion_check:
+                name += "_col"
+            if args.probation:
+                name += f"_prob{args.probation}"
+            if args.c1_attack != 'none':
+                name += f"_c1{args.c1_attack}"
         if args.attack_mode != 'always':
             name += f"_{args.attack_mode}{args.attack_period}"
         if args.whitewash:

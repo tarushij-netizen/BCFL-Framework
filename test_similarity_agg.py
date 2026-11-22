@@ -305,6 +305,56 @@ check("class check on: class-0 attackers rejected, honest kept", run_cls(True) =
 check("class check on, no attackers: nobody rejected", run_cls(True, attackers=0) == [],
       f"(rejected {run_cls(True, attackers=0)})")
 
+# probation for re-registered identities (whitewashing fix)
+def run_prob(probation, rounds=6):
+    Rp = sk.Reputation(probation=probation)
+    Rp.reset(0)                            # client 0 re-registers before round 0
+    seen = []
+    for _ in range(rounds):
+        Rp.update({i: True for i in range(N)})  # everyone passes screening every round
+        seen.append(0 in Rp.eligible(list(range(N))))
+        Rp.tick()
+    return seen, Rp
+seen3, Rp3 = run_prob(3)
+check("probation 3: a fresh identity stays out for 3 rounds even when it passes screening, then joins",
+      seen3 == [False, False, False, True, True, True], f"(in aggregate per round {seen3})")
+check("probation 3: clients present from the start are never on probation",
+      all(i in Rp3.eligible(list(range(N))) for i in range(1, N)))
+check("probation 0: fresh identity joins at once (earlier behaviour)", run_prob(0)[0][0] is True)
+
+# collusion check (non-IID backdoor): colluders share one direction, honest clients each have their own
+rc = np.random.default_rng(77)
+DC = 2000
+basec = {"w": rc.standard_normal(DC)}
+own = [rc.standard_normal(DC) for _ in range(N)]          # each client's own (non-IID) direction
+bd = rc.standard_normal(DC)                               # the shared backdoor direction
+def run_col(attackers, rounds=6, forget_at=None):
+    ag = sk.sketchSecAggAggregator(sketch_dim=64, seed=0, collusion_check=True,
+                                   similarity_threshold=-1.0, magnitude_ratio=1e9)
+    ag.set_global_model(basec)
+    out = []
+    for r in range(rounds):
+        if forget_at is not None and r == forget_at:
+            ag.forget_client(0)
+        rr = np.random.default_rng(100 + r)
+        ms = [{"w": ag.reference_model["w"] + 0.05 * (1.0 + own[i] + (2.0 * bd if i < attackers else 0)
+                                                     + rr.standard_normal(DC))} for i in range(N)]
+        ag.aggregate(ms)
+        out.append(list(ag.last_collusion_rejected))
+    return out, ag
+col3, agc = run_col(3)
+check("collusion check: 3 colluders rejected once their history covers 3 rounds, honest kept",
+      col3[:2] == [[], []] and all(x == [0, 1, 2] for x in col3[2:]), f"(rejected per round {col3}, max cos {agc.last_collusion_max})")
+col0, agc0 = run_col(0)
+check("collusion check: non-IID honest clients only -> nobody rejected", all(x == [] for x in col0),
+      f"(max cos {agc0.last_collusion_max})")
+col2, _ = run_col(2)
+check("collusion check: only 2 colluders -> not flagged (needs a group of 3; known limit)",
+      all(x == [] for x in col2), f"(rejected per round {col2})")
+colf, _ = run_col(3, rounds=6, forget_at=3)
+check("collusion check: a re-registered identity starts with empty history (judged again after warm-up)",
+      0 not in colf[3] and 0 not in colf[4] and 0 in colf[5], f"(rejected per round {colf})")
+
 # 33-40: C1 with real secure aggregation (Diffie-Hellman + Shamir, secaggDH.py)
 dh = importlib.import_module("server.aggregation_alg.secaggDH")
 sh = dh.shamir_share(123456789, 4, [1, 2, 3, 4, 5, 6])

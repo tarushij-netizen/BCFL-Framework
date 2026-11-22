@@ -7,3 +7,4 @@ __pycache__/
 node_modules/
 .brownie/
 results/
+crypto/bcfl_crypto/target/
