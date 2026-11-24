@@ -66,7 +66,7 @@ class MPCScreening:
         self.args = [str(n), str(k), str(c), str(window), repr(float(sim)), repr(float(mag)),
                      repr(float(class_mad)), repr(float(coll_thr)), str(int(group))]
         self.prog = "-".join(["bcfl_screen"] + self.args)
-        self.log_dir = log_dir
+        self.log_dir = log_dir or os.path.join(self.root, "logs-bcfl")
         self.procs, self.clients, self.coord = [], [], None
         self.rounds = 0
         self.last_seconds = 0.0
@@ -97,13 +97,12 @@ class MPCScreening:
         self._certs()
         lib = _load_client_lib(self.root)
         for p in range(self.parties):
-            out = subprocess.DEVNULL
-            if self.log_dir:
-                os.makedirs(self.log_dir, exist_ok=True)
-                out = open(os.path.join(self.log_dir, f"party{p}.log"), "w")
+            os.makedirs(self.log_dir, exist_ok=True)
+            out = open(os.path.join(self.log_dir, f"party{p}.log"), "w")
             self.procs.append(subprocess.Popen(
                 [f"./{self.binary}", "-N", str(self.parties), "-p", str(p), "-pn", str(self.party_port),
                  "-h", "localhost", self.prog], cwd=self.root, stdout=out, stderr=subprocess.STDOUT))
+        self._wait_for_parties()
         hosts = ["localhost"] * self.parties
         with _cwd(self.root):
             self.clients = [lib.Client(hosts, self.port, i) for i in range(self.n)]
@@ -111,6 +110,39 @@ class MPCScreening:
         self._lib = lib
         atexit.register(self.stop)
         return self
+
+    def _ports_listening(self):
+        """True when every party listens on its client port. Checked without connecting: a probe
+        connection would be taken by the party as a client."""
+        ports = [self.port + p for p in range(self.parties)]
+        for cmd in (["lsof", "-nP", f"-iTCP:{ports[0]}-{ports[-1]}", "-sTCP:LISTEN"], ["ss", "-ltnH"]):
+            if shutil.which(cmd[0]) is None:
+                continue
+            out = subprocess.run(cmd, capture_output=True, text=True).stdout
+            return all(f":{p}" in out for p in ports)
+        return None
+
+    def _wait_for_parties(self, timeout=180.0):
+        deadline = time.time() + timeout
+        while True:
+            dead = [p for p, proc in enumerate(self.procs) if proc.poll() is not None]
+            if dead:
+                code = self.procs[dead[0]].returncode
+                log = os.path.join(self.log_dir, f"party{dead[0]}.log")
+                self.stop()
+                tail = open(log).read()[-2000:] if os.path.exists(log) else ""
+                raise RuntimeError(f"MPC party {dead[0]} exited with code {code}; log {log}:\n{tail}")
+            ready = self._ports_listening()
+            if ready is None:                   # no lsof/ss: give the parties a fixed head start
+                time.sleep(5.0)
+                return
+            if ready:
+                return
+            if time.time() > deadline:
+                self.stop()
+                raise RuntimeError(f"MPC parties did not open ports {self.port}..{self.port + self.parties - 1} "
+                                   f"within {timeout:.0f}s; see the logs in {self.log_dir}")
+            time.sleep(0.5)
 
     def _send_public(self, values):
         for sock in self.coord.sockets:
