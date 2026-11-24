@@ -55,14 +55,17 @@ def _load_client_lib(root):
 
 class MPCScreening:
     def __init__(self, n, k, c, window, sim, mag, class_mad, coll_thr, group,
-                 parties=5, root=None, port=14000, party_port=5000, binary="malicious-shamir-party.x",
+                 parties=5, root=None, port=None, party_port=None, binary="malicious-shamir-party.x",
                  log_dir=None):
         self.n, self.k, self.c, self.window = n, k, c, window
         self.parties = parties
         self.root = os.path.abspath(root or os.environ.get("BCFL_MPSPDZ", ""))
         if not os.path.isfile(os.path.join(self.root, binary)):
             raise FileNotFoundError(f"{binary} not found in {self.root!r}: set BCFL_MPSPDZ to the MP-SPDZ folder")
-        self.port, self.party_port, self.binary = port, party_port, binary
+        # party-to-party ports: not MP-SPDZ's default 5000, which macOS uses for AirPlay Receiver
+        self.port = int(port or 14000)        # must match PORT in bcfl_screen.mpc
+        self.party_port = int(party_port or os.environ.get("BCFL_MPC_PARTY_PORT", 16000))
+        self.binary = binary
         self.args = [str(n), str(k), str(c), str(window), repr(float(sim)), repr(float(mag)),
                      repr(float(class_mad)), repr(float(coll_thr)), str(int(group))]
         self.prog = "-".join(["bcfl_screen"] + self.args)
