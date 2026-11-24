@@ -87,13 +87,32 @@ class MPCScreening:
                            cwd=self.root, check=True, stdout=subprocess.DEVNULL)
 
     def _certs(self):
+        """TLS certificates for the parties (P*) and the external clients (C*).
+
+        Made here rather than with MP-SPDZ's setup scripts: those put the name only in the
+        subject CN, and newer OpenSSL/Boost builds (e.g. Homebrew OpenSSL 4 on macOS) check the
+        peer name against subjectAltName only, so every handshake fails. Each certificate here
+        carries its name as a DNS subjectAltName too. Regenerated once (marker file) and whenever
+        one is missing."""
         pd = os.path.join(self.root, "Player-Data")
-        if not all(os.path.exists(os.path.join(pd, f"P{i}.pem")) for i in range(self.parties)):
-            subprocess.run(["Scripts/setup-ssl.sh", str(self.parties)], cwd=self.root, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not all(os.path.exists(os.path.join(pd, f"C{i}.pem")) for i in range(self.n + 1)):
-            subprocess.run(["Scripts/setup-clients.sh", str(self.n + 1)], cwd=self.root, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.makedirs(pd, exist_ok=True)
+        names = [f"P{i}" for i in range(self.parties)] + [f"C{i}" for i in range(self.n + 1)]
+        marker = os.path.join(pd, ".bcfl-certs-san")
+        if os.path.exists(marker) and all(os.path.exists(os.path.join(pd, f"{x}.pem")) for x in names):
+            return
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            raise FileNotFoundError("openssl command not found (needed to make the MPC certificates)")
+        for x in names:
+            subprocess.run([openssl, "req", "-newkey", "rsa:2048", "-nodes", "-x509", "-days", "365",
+                            "-out", os.path.join(pd, f"{x}.pem"), "-keyout", os.path.join(pd, f"{x}.key"),
+                            "-subj", f"/CN={x}", "-addext", f"subjectAltName=DNS:{x}"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for f in os.listdir(pd):                # old hash links of the replaced certificates
+            if f.endswith(".0") and os.path.islink(os.path.join(pd, f)):
+                os.remove(os.path.join(pd, f))
+        subprocess.run([openssl, "rehash", pd], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        open(marker, "w").write("certificates with subjectAltName, made by mpc/screen_mpc.py\n")
 
     def start(self):
         self._compile()
