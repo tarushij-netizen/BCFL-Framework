@@ -1,0 +1,189 @@
+# C1 Phase 2: the screening rule of sketchSecAgg._decide, run by the committee as an MPC.
+#
+# Parties: the committee members (e.g. 5), honest-majority Shamir, malicious-secure
+# (MP-SPDZ malicious-shamir-party.x). Nobody in the committee sees a client's sketch or class
+# profile; the server (aggregator) only learns the verdict bits and the sum of the accepted
+# sketches (needed for the Phase 1 sum check, and equal to the sketch of the public aggregate).
+#
+# External clients (MP-SPDZ client protocol, inputs masked with random shares whose MACs/
+# consistency the client checks):
+#   ids 0..N-1 : FL clients, each sends K sketch integers + C class-profile integers,
+#                all fixed point with 24 fractional bits (secaggField.FRAC_BITS)
+#   id  N      : coordinator (the aggregator server), sends public per-round data and
+#                receives the verdicts
+#
+# Per round:
+#   coordinator -> public: [continue, coll_active, judged[0..N-1], winv[0..N-1]]
+#       winv = round(2^24 / reputation weight) (clients pre-scale their update by the public
+#       weight; screening is done on sketch / weight, as in the plaintext rule)
+#   clients     -> private: sketch, profile
+#   MPC         -> coordinator (authenticated): screen_ok[N], class_ok[N], collusion_flag[N]
+#   coordinator -> public: accepted[0..N-1] (after reputation, outside the MPC)
+#   MPC         -> coordinator (authenticated): sum of accepted raw sketches (K integers)
+#
+# Compile:  ./compile.py -F 128 bcfl_screen N K C W SIM MAG CMAD CTHR GROUP
+#   C = 0 disables the class check, W = 0 disables the collusion check.
+
+from Compiler import mpc_math
+
+args = program.args[1:]
+N, K, C, W = int(args[0]), int(args[1]), int(args[2]), int(args[3])
+SIM, MAG, CMAD, CTHR, GROUP = float(args[4]), float(args[5]), float(args[6]), float(args[7]), int(args[8])
+F = 24
+sfix.set_precision(F, 56)
+cfix.set_precision(F, 56)
+sfix.round_nearest = True       # exact rounding (probabilistic truncation leaks, eprint 2024/1127)
+program.set_bit_length(64)      # sint comparisons (verdict counters); 64 + 40-bit security < 128
+PORT = 14000
+COORD = N
+EPS = 2.0 ** -F
+
+
+def _pairs(n):
+    """Batcher odd-even merge sort network for n inputs (padded to a power of two with +inf)."""
+    p2 = 1
+    while p2 < n:
+        p2 *= 2
+    out, p = [], 1
+    while p < p2:
+        k = p
+        while k >= 1:
+            for j in range(k % p, p2 - k, 2 * k):
+                for i in range(min(k, p2 - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        a, b = i + j, i + j + k
+                        if b < n:
+                            out.append((a, b))
+            k //= 2
+        p *= 2
+    return out
+
+
+def sort_list(xs):
+    xs = list(xs)
+    for a, b in _pairs(len(xs)):
+        swap = xs[a] > xs[b]
+        lo = xs[a] + swap * (xs[b] - xs[a])
+        xs[b] = xs[a] + xs[b] - lo
+        xs[a] = lo
+    return xs
+
+
+def median(xs):
+    s = sort_list(xs)
+    n = len(s)
+    if n % 2:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) * cfix(0.5)
+
+
+def dot(a, b):
+    """a, b: sfix vectors of equal length -> sfix, with a single truncation at the end."""
+    A, B = sfix.Array(len(a)), sfix.Array(len(b))
+    A.assign_vector(a)
+    B.assign_vector(b)
+    return sfix.dot_product(A, B)
+
+
+def absv(x):
+    neg = x < 0
+    return x - 2 * neg * x
+
+
+listen_for_clients(PORT)
+for _ in range(N + 1):
+    accept_client_connection(PORT)
+print_ln('bcfl_screen: %s clients + coordinator connected', N)
+
+coll_hist = sfix.Matrix(max(W, 1), N * N)
+rounds_done = MemValue(regint(0))
+raw = sint.Matrix(N, K)
+
+
+@do_while
+def _round():
+    pub = regint.read_from_socket(regint(COORD), 2 + 2 * N)
+    cont = pub[0]
+
+    @if_(cont)
+    def _():
+        coll_active = pub[1]
+        judged = [pub[2 + i] for i in range(N)]
+        winv = [cfix._new(cint(pub[2 + N + i])) for i in range(N)]
+
+        V, P = [], []
+        for i in range(N):
+            x = sint.receive_from_client(K + C, regint(i))
+            for j in range(K):
+                raw[i][j] = x[j]
+            V.append(sfix._new(sint.concat(x[:K])) * winv[i])
+            if C:
+                P.append(sfix._new(sint.concat(x[K:])))
+
+        # ---- screening: cosine to the coordinate-wise median + norm ratio
+        m = median(V)
+        sq = [dot(v, v) for v in V]
+        nrm = [mpc_math.sqrt(s) for s in sq]
+        sqm = dot(m, m)
+        nm = mpc_math.sqrt(sqm)
+        med_n = median(nrm)
+        screen_ok = []
+        for i in range(N):
+            d = dot(V[i], m)
+            cos_ok = (d >= nrm[i] * nm * cfix(SIM)) * (sq[i] > 0) * (sqm > 0)
+            within = nrm[i] <= med_n * cfix(MAG)
+            no_med = med_n <= 0                      # plaintext: ratio 0 when the median norm is 0
+            ratio_ok = within + no_med - within * no_med
+            screen_ok.append(cos_ok * ratio_ok)
+
+        # ---- class-profile check: robust z-score of the L1 distance to the median profile
+        class_ok = [sint(1)] * N
+        if C:
+            pm = median(P)
+            dist = [absv(P[i] - pm).sum() for i in range(N)]
+            md = median(dist)
+            mad = median([absv(x - md) for x in dist])
+            cut = mad * cfix(1.4826 * CMAD)
+            class_ok = [1 - ((dist[i] - md) > cut) for i in range(N)]
+
+        # ---- collusion check: pairwise cosine of centred sketches, averaged over W rounds
+        coll_flag = [sint(0)] * N
+        if W:
+            U = []
+            for i in range(N):
+                c = V[i] - m
+                inv = 1 / (mpc_math.sqrt(dot(c, c)) + cfix(EPS))
+                U.append(c * inv)
+            g = [sfix(0)] * (N * N)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    g[i * N + j] = g[j * N + i] = dot(U[i], U[j])
+            slot = rounds_done % W
+            coll_hist[slot].assign_vector(sfix.concat(g))
+            avg = sum(coll_hist[r].get_vector() for r in range(W)) * cfix(1.0 / W)
+            above = avg > cfix(CTHR)
+            flags = []
+            for i in range(N):
+                partners = sum(above[i * N + j] * judged[j] for j in range(N) if j != i)
+                flags.append(coll_active * judged[i] * (partners >= GROUP - 1))
+            coll_flag = flags
+
+        out = sint.Array(3 * N)
+        for i in range(N):
+            out[i] = screen_ok[i]
+            out[N + i] = class_ok[i]
+            out[2 * N + i] = coll_flag[i]
+        coord = regint.Array(1)
+        coord[0] = COORD
+        sint.reveal_to_clients(coord, list(out))
+
+        # ---- sum of the accepted raw sketches, for the sum check
+        acc = regint.read_from_socket(regint(COORD), N)
+        total = sint.Array(K)
+        total.assign_all(0)
+        for i in range(N):
+            total.assign_vector(total.get_vector() + raw[i].get_vector() * acc[i])
+        sint.reveal_to_clients(coord, list(total))
+        rounds_done.iadd(1)
+
+    return cont

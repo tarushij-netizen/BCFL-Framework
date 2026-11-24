@@ -88,6 +88,23 @@ In ./config/benchmark.py, each Benchmark contains three parts
 3. Wrap the function call with Brownie SDK in class chainProxy (./chainfl/interact)
 4. Interact with blockchain when training through chainProxy.
 
+### C1 Phase 2: screening as a committee MPC (MP-SPDZ)
+With `--secagg hardened --screening mpc`, the screening rule (cosine to the median sketch, norm
+ratio, class-profile check, collusion check) runs as an MPC among the 5 committee members
+(`mpc/bcfl_screen.mpc`, MP-SPDZ `malicious-shamir-party.x`: honest-majority Shamir, malicious
+security). Clients secret-share their sketch and class profile to the committee; the server learns
+only the verdict bits and the sum of the accepted sketches (for the sum check).
+`--screening mpc-check` runs both the MPC and the plaintext rule and reports any difference.
+
+Setup (macOS: build from source):
+```
+git clone --branch v0.4.4 --depth 1 https://github.com/data61/MP-SPDZ.git ~/MP-SPDZ
+cd ~/MP-SPDZ && make setup && make -j8 malicious-shamir-party.x
+pip install gmpy2
+export BCFL_MPSPDZ=~/MP-SPDZ
+python test_phase2.py
+```
+
 ## Relative Article
 [1] [VeryFL Design] [VeryFL: A Verify Federated Learning Framework Embedded with Blockchain](http://106.52.19.28/resource/VeryFL.pdf)(Arxiv)
 

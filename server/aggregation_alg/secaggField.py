@@ -166,3 +166,8 @@ def sum_check(sum_int, sketches, accepted, h, s, k):
     for i in accepted:
         expected += np.asarray(sketches[i], dtype=np.int64)
     return bool(np.array_equal(sketch_int(sum_int, h, s, k), expected))
+
+
+def sum_check_total(sum_int, sketch_total, h, s, k):
+    """Same check when the committee reveals only the total of the accepted sketches (Phase 2)."""
+    return bool(np.array_equal(sketch_int(sum_int, h, s, k), np.asarray(sketch_total, dtype=np.int64)))

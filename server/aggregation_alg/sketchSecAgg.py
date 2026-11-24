@@ -176,13 +176,24 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                  mask_scale=100.0, seed=0, reputation=False, rep_init=0.75, rep_beta=0.7, rep_tau=0.6,
                  rep_penalty=0.5, class_check=False, class_mad=3.0, secagg="sim", secagg_threshold=None,
                  c1_attack="none", beacon_n=5, beacon_t=3, probation=0, collusion_check=False,
-                 collusion_window=3, collusion_threshold=0.35, collusion_group=3, model=None, args=None):
+                 collusion_window=3, collusion_threshold=0.35, collusion_group=3, dump_screening=None,
+                 screening="plain", model=None, args=None):
         ServerAggregator.__init__(self, model, args)
         if secagg not in ("sim", "dh", "hardened"):
             raise ValueError(f"secagg must be 'sim', 'dh' or 'hardened', got {secagg!r}")
         if c1_attack not in ("none", "sketchlie", "nullspace"):
             raise ValueError(f"c1_attack must be 'none', 'sketchlie' or 'nullspace', got {c1_attack!r}")
+        if screening not in ("plain", "mpc", "mpc-check"):
+            raise ValueError(f"screening must be 'plain', 'mpc' or 'mpc-check', got {screening!r}")
+        if screening != "plain" and secagg != "hardened":
+            raise ValueError("screening='mpc' needs secagg='hardened'")
         self.secagg = secagg
+        self.screening = screening
+        self.mpc = None                 # MPCScreening, started on the first round
+        self.mpc_mismatch_rounds = 0
+        self.last_mpc_diff = []
+        self.last_mpc_seconds = 0.0
+        self._coll_rounds = 0
         self.c1_attack = c1_attack
         self.beacon_n, self.beacon_t = beacon_n, beacon_t
         self.board = None            # bulletin board (MemoryBoard, or ChainBoard with --onchain)
@@ -210,6 +221,7 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self.last_head_rejected = []
         self.last_screen_rejected = []
         self.last_rep_excluded = []
+        self.dump_screening = dump_screening   # directory: save each round's screening inputs/verdicts
         self.k = sketch_dim
         self.similarity_threshold = similarity_threshold
         self.magnitude_ratio = magnitude_ratio
@@ -235,12 +247,60 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
         return total / denom, accepted, sims, ratios
 
-    def _decide(self, sketches, profiles, n):
-        """Screening on sketches, class-profile check, reputation: the accepted set."""
-        accepted, sims, ratios = screen(sketches, self.similarity_threshold, self.magnitude_ratio)
-        self.last_screen_rejected = [i for i in range(n) if i not in accepted]
+    def _decide(self, sketches, profiles, n, sketch_ints=None, weights=None):
+        """Screening on sketches, class-profile check, collusion check, then reputation: the
+        accepted set. The three checks run either in plaintext at the server (screening="plain")
+        or as an MPC among the committee (screening="mpc", mpc/bcfl_screen.mpc; needs the
+        integer sketches of hardened mode). screening="mpc-check" runs both and counts rounds
+        where the verdicts differ (a development check: the plaintext side sees the sketches)."""
+        ages_before = dict(self._ages)
+        if self.collusion_check:
+            for i in range(n):
+                self._ages[i] = self._ages.get(i, 0) + 1
+        sims, ratios = [], []
+        if self.screening in ("plain", "mpc-check"):
+            screen_ok, class_ok, coll_flag, sims, ratios = self._checks_plain(sketches, profiles, n)
+        if self.screening in ("mpc", "mpc-check"):
+            if sketch_ints is None:
+                raise ValueError("screening='mpc' needs --secagg hardened (integer sketches)")
+            m = self._checks_mpc(sketch_ints, profiles, n, weights)
+            if self.screening == "mpc-check":
+                plain = (screen_ok, class_ok, coll_flag)
+                diff = [(name, i) for name, a, b in zip(("screen", "class", "collusion"), plain, m)
+                        for i in range(n) if bool(a[i]) != bool(b[i])]
+                self.last_mpc_diff = diff
+                if diff:
+                    self.mpc_mismatch_rounds += 1
+                    print(f"[sketchSecAgg] round {self.round}: MPC and plaintext verdicts differ: {diff}")
+            screen_ok, class_ok, coll_flag = m
+        accepted = [i for i in range(n) if screen_ok[i]]
+        self.last_screen_rejected = [i for i in range(n) if not screen_ok[i]]
+        self.last_head_rejected = [i for i in accepted if not class_ok[i]]
+        accepted = [i for i in accepted if class_ok[i]]
+        self.last_collusion_rejected = [i for i in accepted if coll_flag[i]]
+        accepted = [i for i in accepted if not coll_flag[i]]
         self.last_rep_excluded = []
-        self.last_head_rejected = []
+        if self.reputation is not None:
+            self.reputation.update({i: (i in accepted) for i in range(n)})
+            eligible = self.reputation.eligible(accepted)
+            self.last_rep_excluded = [i for i in accepted if i not in eligible]
+            accepted = eligible
+            self.reputation.tick()
+        if self.dump_screening:
+            self._dump(sketches, profiles, n, ages_before, accepted, sketch_ints, weights)
+        return accepted, sims, ratios
+
+    def _collusion_public(self, n):
+        """Public inputs of the collusion check: who is judged, and whether it runs this round."""
+        self._coll_rounds += 1
+        judged = [self._ages.get(i, 0) >= self.collusion_window for i in range(n)]
+        active = self._coll_rounds >= self.collusion_window and sum(judged) >= self.collusion_group
+        return judged, active
+
+    def _checks_plain(self, sketches, profiles, n):
+        accepted, sims, ratios = screen(sketches, self.similarity_threshold, self.magnitude_ratio)
+        screen_ok = [i in accepted for i in range(n)]
+        class_ok = [True] * n
         if self.class_check and profiles[0] is not None:
             P = np.stack(profiles)
             med = np.median(P, axis=0)
@@ -248,27 +308,44 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             mad = np.median(np.abs(dist - np.median(dist))) + 1e-12
             z = (dist - np.median(dist)) / (1.4826 * mad)
             self.last_class_z = np.round(z, 2).tolist()
-            self.last_head_rejected = [i for i in accepted if z[i] > self.class_mad]
-            accepted = [i for i in accepted if z[i] <= self.class_mad]
-        self.last_collusion_rejected = []
+            class_ok = [bool(z[i] <= self.class_mad) for i in range(n)]
+        coll_flag = [False] * n
         if self.collusion_check:
             V = np.stack([np.asarray(v, dtype=np.float64) for v in sketches])
             C = V - np.median(V, axis=0)                             # remove the common direction
             C /= np.linalg.norm(C, axis=1, keepdims=True) + 1e-12
             self._cos_hist = (self._cos_hist + [C @ C.T])[-self.collusion_window:]
-            for i in range(n):
-                self._ages[i] = self._ages.get(i, 0) + 1
             flagged, self.last_collusion_max = collusion_flags(
                 self._cos_hist, self._ages, self.collusion_window, self.collusion_threshold, self.collusion_group)
-            self.last_collusion_rejected = [i for i in accepted if i in flagged]
-            accepted = [i for i in accepted if i not in flagged]
-        if self.reputation is not None:
-            self.reputation.update({i: (i in accepted) for i in range(n)})
-            eligible = self.reputation.eligible(accepted)
-            self.last_rep_excluded = [i for i in accepted if i not in eligible]
-            accepted = eligible
-            self.reputation.tick()
-        return accepted, sims, ratios
+            coll_flag = [i in flagged for i in range(n)]
+        return screen_ok, class_ok, coll_flag, sims, ratios
+
+    def _checks_mpc(self, sketch_ints, profiles, n, weights):
+        if self.mpc is None:
+            from mpc.screen_mpc import MPCScreening
+            c = len(profiles[0]) if (self.class_check and profiles[0] is not None) else 0
+            self.mpc = MPCScreening(n, self.k, c, self.collusion_window if self.collusion_check else 0,
+                                    self.similarity_threshold, self.magnitude_ratio, self.class_mad,
+                                    self.collusion_threshold, self.collusion_group,
+                                    parties=self.beacon_n).start()
+        judged, active = self._collusion_public(n) if self.collusion_check else ([False] * n, False)
+        prof_ints = [sf.encode_int(p) for p in profiles] if self.mpc.c else None
+        s_ok, c_ok, flag = self.mpc.decide(sketch_ints, prof_ints, weights, judged, active)
+        return [bool(x) for x in s_ok], [bool(x) for x in c_ok], [bool(x) for x in flag]
+
+    def _dump(self, sketches, profiles, n, ages_before, accepted, sketch_ints, weights):
+        import os
+        os.makedirs(self.dump_screening, exist_ok=True)
+        np.savez(os.path.join(self.dump_screening, f"round_{self.round:03d}.npz"),
+                 sketches=np.stack([np.asarray(v, dtype=np.float64) for v in sketches]),
+                 sketch_ints=np.zeros((0,)) if sketch_ints is None else np.stack(sketch_ints),
+                 weights=np.ones(n) if weights is None else np.asarray(weights, dtype=np.float64),
+                 profiles=np.stack(profiles) if profiles[0] is not None else np.zeros((0,)),
+                 ages=np.array([ages_before.get(i, 0) for i in range(n)]),
+                 screen_rej=np.array(self.last_screen_rejected, dtype=int),
+                 class_rej=np.array(self.last_head_rejected, dtype=int),
+                 coll_rej=np.array(self.last_collusion_rejected, dtype=int),
+                 accepted=np.array(accepted, dtype=int))
 
     def forget_client(self, i):
         """Client i re-registers under a new identity: fresh reputation (with probation, if set)
@@ -392,13 +469,19 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                 raise RuntimeError(f"round {rnd}: client {i}'s upload does not match its commitment")
         wts = [1.0] * n if weights is None else [max(w, 1e-12) for w in weights]
         float_sketches = [sf.decode_int(sketches[i]) / wts[i] for i in range(n)]
-        accepted, sims, ratios = self._decide(float_sketches, profiles, n)
+        accepted, sims, ratios = self._decide(float_sketches, profiles, n, sketches, weights)
         self.last_update_hashes = hashes
         self.last_sum_check = None
         mean = None
         if accepted:
             sum_int = frnd.server_unmask_sum_int(uploads, accepted)
-            self.last_sum_check = sf.sum_check(sum_int, sketches, accepted, h, s, self.k)
+            if self.screening in ("mpc", "mpc-check"):
+                # the committee reveals only the sum of the accepted sketches
+                total = self.mpc.sum_accepted(accepted)
+                self.last_sum_check = sf.sum_check_total(sum_int, total, h, s, self.k)
+                self.last_mpc_seconds = self.mpc.last_seconds
+            else:
+                self.last_sum_check = sf.sum_check(sum_int, sketches, accepted, h, s, self.k)
             self.board.post("round_outcome", rnd, "server", "sum_check", self.last_sum_check)
             if self.last_sum_check:
                 denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)

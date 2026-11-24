@@ -209,7 +209,8 @@ class Task:
             writer = csv.writer(f)
             writer.writerow(['round', 'global_acc', 'global_loss', 'rejected',
                              'malicious_caught', 'honest_rejected', 'backdoor_asr',
-                             'attack_on', 'malicious_included'])
+                             'attack_on', 'malicious_included', 'rej_screen', 'rej_class',
+                             'rej_collusion', 'rej_reputation', 'collusion_max_cos'])
         client_test = self.global_args.get('client_test', True)
 
         for i in range(self.global_args['communication_round']):
@@ -270,7 +271,12 @@ class Task:
             if writer:
                 writer.writerow([i, f"{res['acc']:.4f}", f"{res['loss']:.6f}",
                                  ' '.join(map(str, rejected)), caught, honest_rej,
-                                 '' if asr is None else f"{asr:.4f}", int(on), mal_in])
+                                 '' if asr is None else f"{asr:.4f}", int(on), mal_in]
+                                + [' '.join(map(str, getattr(self.server, a, []) or [])) for a in
+                                   ('last_screen_rejected', 'last_head_rejected', 'last_collusion_rejected',
+                                    'last_rep_excluded')]
+                                + [getattr(self.server, 'last_collusion_max', '')
+                                   if getattr(self.server, 'collusion_check', False) else ''])
                 f.flush()
         if writer:
             f.close()
