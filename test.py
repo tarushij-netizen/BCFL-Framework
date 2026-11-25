@@ -44,6 +44,8 @@ if __name__=="__main__":
                         help="repsketch: rounds a re-registered identity stays out of aggregation (whitewashing fix)")
     parser.add_argument('--collusion-check', action='store_true',
                         help="sketch/repsketch: reject groups of >= 3 clients that push the same direction round after round")
+    parser.add_argument('--collusion-threshold', type=float, default=0.5,
+                        help="collusion check: average pairwise cosine (over the window) that counts two clients as partners")
     parser.add_argument('--screening', choices=['plain', 'mpc', 'mpc-check'], default='plain',
                         help="repsketch + --secagg hardened: run screening in plaintext at the server, or as an "
                              "MPC among the committee (MP-SPDZ, set BCFL_MPSPDZ); mpc-check runs both and compares")
@@ -114,6 +116,7 @@ if __name__=="__main__":
                           'class_check': args.class_check, 'class_mad': args.class_mad,
                           'secagg': args.secagg, 'c1_attack': args.c1_attack,
                           'collusion_check': args.collusion_check,
+                          'collusion_threshold': args.collusion_threshold,
                           'dump_screening': args.dump_screening, 'screening': args.screening}
             if args.aggregator == 'repsketch':
                 agg_kwargs.update({'reputation': True, 'rep_init': args.rep_init,
@@ -137,7 +140,7 @@ if __name__=="__main__":
             if args.secagg in ('dh', 'hardened'):
                 name += "_dh" if args.secagg == 'dh' else "_hard"
             if args.collusion_check:
-                name += "_col"
+                name += "_col" if args.collusion_threshold == 0.5 else f"_col{args.collusion_threshold:g}"
             if args.screening != 'plain':
                 name += "_mpc" if args.screening == 'mpc' else "_mpcchk"
             if args.probation:

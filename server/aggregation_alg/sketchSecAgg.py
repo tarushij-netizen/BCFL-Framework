@@ -176,7 +176,7 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                  mask_scale=100.0, seed=0, reputation=False, rep_init=0.75, rep_beta=0.7, rep_tau=0.6,
                  rep_penalty=0.5, class_check=False, class_mad=3.0, secagg="sim", secagg_threshold=None,
                  c1_attack="none", beacon_n=5, beacon_t=3, probation=0, collusion_check=False,
-                 collusion_window=3, collusion_threshold=0.35, collusion_group=3, dump_screening=None,
+                 collusion_window=3, collusion_threshold=0.5, collusion_group=3, dump_screening=None,
                  screening="plain", model=None, args=None):
         ServerAggregator.__init__(self, model, args)
         if secagg not in ("sim", "dh", "hardened"):

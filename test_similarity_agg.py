@@ -337,7 +337,8 @@ def run_col(attackers, rounds=6, forget_at=None):
         if forget_at is not None and r == forget_at:
             ag.forget_client(0)
         rr = np.random.default_rng(100 + r)
-        ms = [{"w": ag.reference_model["w"] + 0.05 * (1.0 + own[i] + (2.0 * bd if i < attackers else 0)
+        # backdoor weight 3: pairwise cosine ~0.8 among colluders, as measured on FashionMNIST non-IID
+        ms = [{"w": ag.reference_model["w"] + 0.05 * (1.0 + own[i] + (3.0 * bd if i < attackers else 0)
                                                      + rr.standard_normal(DC))} for i in range(N)]
         ag.aggregate(ms)
         out.append(list(ag.last_collusion_rejected))
