@@ -12,8 +12,9 @@ MemoryBoard keeps the log in Python (runs without a blockchain). ChainBoard (cha
 also writes every post to ReputationLedger, which enforces the same phase rules on chain.
 """
 
-OPEN_KINDS = {"upload_commit", "beacon_deal", "beacon_complaint", "beacon_open"}
-CLOSED_KINDS = {"beacon_reveal", "beacon_recon", "round_outcome"}
+OPEN_KINDS = {"upload_commit", "beacon_deal", "beacon_complaint", "beacon_open",
+              "secagg_deal", "secagg_complaint", "secagg_open"}
+CLOSED_KINDS = {"beacon_reveal", "beacon_recon", "round_outcome", "secagg_reveal"}
 
 
 class PhaseError(PermissionError):

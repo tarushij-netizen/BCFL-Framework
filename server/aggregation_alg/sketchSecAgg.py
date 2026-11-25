@@ -21,6 +21,12 @@ What this simulation does and does not do
 - secagg="hardened" (Phase 1, secaggField.py): masks in the Ristretto255 scalar field, uploads
   committed on the bulletin board before the round's sketch seed exists, the seed drawn by the
   committee beacon (chainfl/beacon.py), and the sum check S(sum of accepted) == sum of sketches.
+- secagg_vss (default True, hardened only; Phase 3, secaggVSS.py): the mask secrets are shared
+  with Feldman VSS. A client whose shares do not match its public commitments (and who does not
+  fix them when a holder complains) is left out of the round, and a holder that returns a wrong
+  share at unmasking is caught and named. secagg_vss=False is the Phase 1 round (plain Shamir).
+- c1_attack "badshare" / "badreveal" (malicious clients, any data attack): hand holders wrong
+  shares and ignore complaints / return wrong shares at unmasking (gap 1).
 - c1_attack (test attacker against C1 itself, needs attack="signflip" so the attacker knows its
   benign "cover" update -u/scale): "sketchlie" reports the sketch of the cover while masking the
   poisoned update (gap 3); "nullspace" adds the poison only in directions the sketch it expects
@@ -177,12 +183,12 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                  rep_penalty=0.5, class_check=False, class_mad=3.0, secagg="sim", secagg_threshold=None,
                  c1_attack="none", beacon_n=5, beacon_t=3, probation=0, collusion_check=False,
                  collusion_window=3, collusion_threshold=0.5, collusion_group=3, dump_screening=None,
-                 screening="plain", model=None, args=None):
+                 screening="plain", secagg_vss=True, model=None, args=None):
         ServerAggregator.__init__(self, model, args)
         if secagg not in ("sim", "dh", "hardened"):
             raise ValueError(f"secagg must be 'sim', 'dh' or 'hardened', got {secagg!r}")
-        if c1_attack not in ("none", "sketchlie", "nullspace"):
-            raise ValueError(f"c1_attack must be 'none', 'sketchlie' or 'nullspace', got {c1_attack!r}")
+        if c1_attack not in ("none", "sketchlie", "nullspace", "badshare", "badreveal"):
+            raise ValueError(f"c1_attack must be none, sketchlie, nullspace, badshare or badreveal, got {c1_attack!r}")
         if screening not in ("plain", "mpc", "mpc-check"):
             raise ValueError(f"screening must be 'plain', 'mpc' or 'mpc-check', got {screening!r}")
         if screening != "plain" and secagg != "hardened":
@@ -195,6 +201,12 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self.last_mpc_seconds = 0.0
         self._coll_rounds = 0
         self.c1_attack = c1_attack
+        self.secagg_vss = secagg_vss
+        self._box_keys = None        # clients' long-term box keys (X25519), made on the first VSS round
+        self.last_vss_rejected = []  # clients left out of the round by VSS (Phase 3)
+        self.last_bad_reveals = []   # holders caught returning a wrong share
+        self.vss_rejections = 0
+        self.unmask_failures = 0
         self.beacon_n, self.beacon_t = beacon_n, beacon_t
         self.board = None            # bulletin board (MemoryBoard, or ChainBoard with --onchain)
         self.beacon = None
@@ -247,34 +259,37 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
         return total / denom, accepted, sims, ratios
 
-    def _decide(self, sketches, profiles, n, sketch_ints=None, weights=None):
+    def _decide(self, sketches, profiles, n, sketch_ints=None, weights=None, absent=frozenset()):
         """Screening on sketches, class-profile check, collusion check, then reputation: the
         accepted set. The three checks run either in plaintext at the server (screening="plain")
         or as an MPC among the committee (screening="mpc", mpc/bcfl_screen.mpc; needs the
         integer sketches of hardened mode). screening="mpc-check" runs both and counts rounds
-        where the verdicts differ (a development check: the plaintext side sees the sketches)."""
+        where the verdicts differ (a development check: the plaintext side sees the sketches).
+        absent: clients not in this round (left out by VSS): no sketch, rejected, and every
+        median / collusion comparison is over the present clients only."""
+        absent = set(absent)
         ages_before = dict(self._ages)
         if self.collusion_check:
             for i in range(n):
                 self._ages[i] = self._ages.get(i, 0) + 1
         sims, ratios = [], []
         if self.screening in ("plain", "mpc-check"):
-            screen_ok, class_ok, coll_flag, sims, ratios = self._checks_plain(sketches, profiles, n)
+            screen_ok, class_ok, coll_flag, sims, ratios = self._checks_plain(sketches, profiles, n, absent)
         if self.screening in ("mpc", "mpc-check"):
             if sketch_ints is None:
                 raise ValueError("screening='mpc' needs --secagg hardened (integer sketches)")
-            m = self._checks_mpc(sketch_ints, profiles, n, weights)
+            m = self._checks_mpc(sketch_ints, profiles, n, weights, absent)
             if self.screening == "mpc-check":
                 plain = (screen_ok, class_ok, coll_flag)
                 diff = [(name, i) for name, a, b in zip(("screen", "class", "collusion"), plain, m)
-                        for i in range(n) if bool(a[i]) != bool(b[i])]
+                        for i in range(n) if i not in absent and bool(a[i]) != bool(b[i])]
                 self.last_mpc_diff = diff
                 if diff:
                     self.mpc_mismatch_rounds += 1
                     print(f"[sketchSecAgg] round {self.round}: MPC and plaintext verdicts differ: {diff}")
             screen_ok, class_ok, coll_flag = m
-        accepted = [i for i in range(n) if screen_ok[i]]
-        self.last_screen_rejected = [i for i in range(n) if not screen_ok[i]]
+        accepted = [i for i in range(n) if i not in absent and screen_ok[i]]
+        self.last_screen_rejected = [i for i in range(n) if i not in absent and not screen_ok[i]]
         self.last_head_rejected = [i for i in accepted if not class_ok[i]]
         accepted = [i for i in accepted if class_ok[i]]
         self.last_collusion_rejected = [i for i in accepted if coll_flag[i]]
@@ -290,37 +305,44 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             self._dump(sketches, profiles, n, ages_before, accepted, sketch_ints, weights)
         return accepted, sims, ratios
 
-    def _collusion_public(self, n):
+    def _collusion_public(self, n, absent=frozenset()):
         """Public inputs of the collusion check: who is judged, and whether it runs this round."""
         self._coll_rounds += 1
-        judged = [self._ages.get(i, 0) >= self.collusion_window for i in range(n)]
+        judged = [i not in absent and self._ages.get(i, 0) >= self.collusion_window for i in range(n)]
         active = self._coll_rounds >= self.collusion_window and sum(judged) >= self.collusion_group
         return judged, active
 
-    def _checks_plain(self, sketches, profiles, n):
-        accepted, sims, ratios = screen(sketches, self.similarity_threshold, self.magnitude_ratio)
-        screen_ok = [i in accepted for i in range(n)]
+    def _checks_plain(self, sketches, profiles, n, absent=frozenset()):
+        present = [i for i in range(n) if i not in absent]
+        acc_p, sims_p, ratios_p = screen([sketches[i] for i in present], self.similarity_threshold,
+                                         self.magnitude_ratio)
+        screen_ok, sims, ratios = [False] * n, [0.0] * n, [0.0] * n
+        for r, i in enumerate(present):
+            screen_ok[i], sims[i], ratios[i] = r in acc_p, sims_p[r], ratios_p[r]
         class_ok = [True] * n
         if self.class_check and profiles[0] is not None:
-            P = np.stack(profiles)
+            P = np.stack([profiles[i] for i in present])
             med = np.median(P, axis=0)
             dist = np.abs(P - med).sum(axis=1)                    # L1 distance to the median profile
             mad = np.median(np.abs(dist - np.median(dist))) + 1e-12
             z = (dist - np.median(dist)) / (1.4826 * mad)
             self.last_class_z = np.round(z, 2).tolist()
-            class_ok = [bool(z[i] <= self.class_mad) for i in range(n)]
+            for r, i in enumerate(present):
+                class_ok[i] = bool(z[r] <= self.class_mad)
         coll_flag = [False] * n
         if self.collusion_check:
             V = np.stack([np.asarray(v, dtype=np.float64) for v in sketches])
-            C = V - np.median(V, axis=0)                             # remove the common direction
+            C = V - np.median(V[present], axis=0)                  # remove the common direction
             C /= np.linalg.norm(C, axis=1, keepdims=True) + 1e-12
+            C[sorted(absent)] = 0.0                                 # absent: cosine 0 with everyone
             self._cos_hist = (self._cos_hist + [C @ C.T])[-self.collusion_window:]
+            ages = {i: (0 if i in absent else a) for i, a in self._ages.items()}
             flagged, self.last_collusion_max = collusion_flags(
-                self._cos_hist, self._ages, self.collusion_window, self.collusion_threshold, self.collusion_group)
+                self._cos_hist, ages, self.collusion_window, self.collusion_threshold, self.collusion_group)
             coll_flag = [i in flagged for i in range(n)]
         return screen_ok, class_ok, coll_flag, sims, ratios
 
-    def _checks_mpc(self, sketch_ints, profiles, n, weights):
+    def _checks_mpc(self, sketch_ints, profiles, n, weights, absent=frozenset()):
         if self.mpc is None:
             from mpc.screen_mpc import MPCScreening
             c = len(profiles[0]) if (self.class_check and profiles[0] is not None) else 0
@@ -328,9 +350,10 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                                     self.similarity_threshold, self.magnitude_ratio, self.class_mad,
                                     self.collusion_threshold, self.collusion_group,
                                     parties=self.beacon_n).start()
-        judged, active = self._collusion_public(n) if self.collusion_check else ([False] * n, False)
+        judged, active = self._collusion_public(n, absent) if self.collusion_check else ([False] * n, False)
         prof_ints = [sf.encode_int(p) for p in profiles] if self.mpc.c else None
-        s_ok, c_ok, flag = self.mpc.decide(sketch_ints, prof_ints, weights, judged, active)
+        present = [i not in absent for i in range(n)]
+        s_ok, c_ok, flag = self.mpc.decide(sketch_ints, prof_ints, weights, judged, active, present)
         return [bool(x) for x in s_ok], [bool(x) for x in c_ok], [bool(x) for x in flag]
 
     def _dump(self, sketches, profiles, n, ages_before, accepted, sketch_ints, weights):
@@ -355,8 +378,28 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self._ages[i] = 0
 
     # ----- test attacker against C1 itself (gaps 2 and 3)
+    def _share_attackers(self):
+        """Malicious clients running the badshare / badreveal attack this round."""
+        if self.c1_attack not in ("badshare", "badreveal"):
+            return set()
+        try:
+            from client.poisonedLoader import attack_on
+            if not attack_on(self.round):
+                return set()
+        except ImportError:
+            pass
+        return set(getattr(self, "malicious", []))
+
+    def _share_faults(self, n):
+        atk = self._share_attackers()
+        if self.c1_attack == "badshare":
+            return {"bad_share": {(i, j) for i in atk for j in range(n) if j != i}, "ignore_complaints": atk}
+        if self.c1_attack == "badreveal":
+            return {"wrong_reveal": atk}
+        return {}
+
     def _attacking(self, i):
-        if self.c1_attack == "none" or i not in set(getattr(self, "malicious", [])):
+        if self.c1_attack in ("none", "badshare", "badreveal") or i not in set(getattr(self, "malicious", [])):
             return False
         if getattr(self, "attack", "none") != "signflip":
             raise ValueError("c1_attack needs attack='signflip' (the attacker's cover update is -u/scale)")
@@ -439,61 +482,100 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         return rows / (rows.sum() + 1e-12)
 
     def _hardened_round(self, models, keys, ref, d, n, weights, profiles, guessed_hs):
-        """Phase 1 round: commit uploads -> beacon seed -> sketches -> screening -> unmask the
-        accepted sum -> sum check. Client and server steps are kept apart as in the other modes."""
+        """Phase 1 + 3 round: VSS setup -> commit uploads -> beacon seed -> sketches -> screening ->
+        unmask the accepted sum -> sum check. Client and server steps are kept apart as in the
+        other modes."""
         t0 = time.perf_counter()
         self._ensure_board()
         rnd = self.round
+        faults = self._share_faults(n)
         self.beacon.run_open_phase(rnd)                 # beacon deals while uploads are open
-        frnd = sf.FieldSecAggRound(n, d, self.secagg_threshold)
+        if self.secagg_vss:
+            from .secaggVSS import VSSSecAggRound, upload_hash as vss_upload_hash
+            if self._box_keys is None:
+                from secure.channel import KeyPair
+                self._box_keys = {i: KeyPair() for i in range(n)}
+            frnd = VSSSecAggRound(n, d, self.board, rnd, self.secagg_threshold, self._box_keys, faults)
+            qualified = frnd.setup()                    # deals, complaints, answers: on the board
+        else:
+            frnd = sf.FieldSecAggRound(n, d, self.secagg_threshold, faults)
+            qualified = list(range(n))
+        absent = [i for i in range(n) if i not in qualified]
+        self.last_vss_rejected = absent
+        self.vss_rejections += len(absent)
         uploads, x_ints, cover_ints = {}, {}, {}
-        for i, m in enumerate(models):                  # client side, before any seed exists
-            u_true = _flatten(m, keys) - ref
+        for i in qualified:                             # client side, before any seed exists
+            u_true = _flatten(models[i], keys) - ref
             u, u_sk = self._adversary(i, u_true, guessed_hs)
             w = 1.0 if weights is None else weights[i]
             x_ints[i] = sf.encode_int(w * u)
             cover_ints[i] = sf.encode_int(w * u_sk)
             uploads[i] = frnd.client_upload_int(i, x_ints[i])
-        hashes = [sf.upload_hash(rnd, i, uploads[i]) for i in range(n)]
+
+        def commitment(i):
+            if i not in uploads:                        # left out by VSS: nothing uploaded
+                return hashlib.sha256(b"bcfl-absent|" + int(rnd).to_bytes(8, "big") + int(i).to_bytes(4, "big")).digest()
+            return frnd.upload_hash(i, uploads[i]) if self.secagg_vss else sf.upload_hash(rnd, i, uploads[i])
+        hashes = [commitment(i) for i in range(n)]
         self.board.commit_uploads(rnd, hashes)          # uploads fixed; round closed
         seed = self.beacon.run_closed_phase(rnd)        # only now is the sketch defined
         h, s = sf.sketch_params_from_seed(seed, d, self.k)
         sketches = []
         for i in range(n):                              # client side: report a sketch
+            if i not in uploads:
+                sketches.append(np.zeros(self.k, dtype=np.int64))
+                continue
             honest = self.c1_attack == "nullspace" or not self._attacking(i)
             sketches.append(sf.sketch_int(x_ints[i] if honest else cover_ints[i], h, s, self.k))
         # server side: check uploads against the board, screen, unmask, check the sum
         posted = self.board.upload_commitments(rnd)
-        for i in range(n):
-            if sf.upload_hash(rnd, i, uploads[i]) != posted[i]:
+        for i in qualified:
+            if commitment(i) != posted[i]:
                 raise RuntimeError(f"round {rnd}: client {i}'s upload does not match its commitment")
         wts = [1.0] * n if weights is None else [max(w, 1e-12) for w in weights]
         float_sketches = [sf.decode_int(sketches[i]) / wts[i] for i in range(n)]
-        accepted, sims, ratios = self._decide(float_sketches, profiles, n, sketches, weights)
+        accepted, sims, ratios = self._decide(float_sketches, profiles, n, sketches, weights, absent=set(absent))
         self.last_update_hashes = hashes
         self.last_sum_check = None
+        self.last_bad_reveals = []
         mean = None
         if accepted:
-            sum_int = frnd.server_unmask_sum_int(uploads, accepted)
-            if self.screening in ("mpc", "mpc-check"):
-                # the committee reveals only the sum of the accepted sketches
-                total = self.mpc.sum_accepted(accepted)
-                self.last_sum_check = sf.sum_check_total(sum_int, total, h, s, self.k)
-                self.last_mpc_seconds = self.mpc.last_seconds
-            else:
-                self.last_sum_check = sf.sum_check(sum_int, sketches, accepted, h, s, self.k)
-            self.board.post("round_outcome", rnd, "server", "sum_check", self.last_sum_check)
-            if self.last_sum_check:
-                denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
-                mean = sf.decode_int(sum_int) / denom
-            else:
+            try:
+                if self.secagg_vss:
+                    frnd.holders_reveal(accepted)       # shares go on the board (closed phase)
+                    sum_int = frnd.server_unmask_sum_int(uploads, accepted)
+                    self.last_bad_reveals = sorted(frnd.bad_reveals)
+                else:
+                    sum_int = frnd.server_unmask_sum_int(uploads, accepted)
+            except RuntimeError as e:                   # Phase 1: a wrong share can make unmasking fail
+                self.unmask_failures += 1
+                self.last_sum_check = False
                 self.sum_check_failures += 1
-                print(f"[sketchSecAgg] round {rnd}: SUM CHECK FAILED: the accepted sketches do not add up "
-                      f"to the sketch of the unmasked sum; round discarded, previous global model kept")
+                print(f"[sketchSecAgg] round {rnd}: UNMASKING FAILED ({e}); round discarded")
+                sum_int = None
+            if sum_int is not None:
+                if self.screening in ("mpc", "mpc-check"):
+                    # the committee reveals only the sum of the accepted sketches
+                    total = self.mpc.sum_accepted(accepted)
+                    self.last_sum_check = sf.sum_check_total(sum_int, total, h, s, self.k)
+                    self.last_mpc_seconds = self.mpc.last_seconds
+                else:
+                    self.last_sum_check = sf.sum_check(sum_int, sketches, accepted, h, s, self.k)
+                if self.last_sum_check:
+                    denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
+                    mean = sf.decode_int(sum_int) / denom
+                else:
+                    self.sum_check_failures += 1
+                    print(f"[sketchSecAgg] round {rnd}: SUM CHECK FAILED: the accepted sketches do not add up "
+                          f"to the sketch of the unmasked sum; round discarded, previous global model kept")
+            self.board.post("round_outcome", rnd, "server", "sum_check", bool(self.last_sum_check))
+        if self.last_bad_reveals:
+            print(f"[sketchSecAgg] round {rnd}: holders {self.last_bad_reveals} returned shares that fail "
+                  f"the VSS check; their shares were not used")
         self.last_secagg_seconds = time.perf_counter() - t0
         logger.info(f"[sketchSecAgg] round {rnd}: hardened round {self.last_secagg_seconds:.2f}s "
-                    f"(n={n}, d={d}, threshold {frnd.t}, beacon seed {seed.hex()[:16]}..., "
-                    f"sum check {self.last_sum_check})")
+                    f"(n={n}, d={d}, threshold {frnd.t}, vss {self.secagg_vss}, left out {absent}, "
+                    f"beacon seed {seed.hex()[:16]}..., sum check {self.last_sum_check})")
         return mean, accepted, sims, ratios
 
     def _finish_round(self, mean_update, accepted, sims, ratios, models, keys, ref, n, _unused):
@@ -510,6 +592,8 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                     f"ratio={np.round(ratios, 2).tolist()} rejected={self.rejected_last_round}")
         if self.rejected_last_round:
             extra = f" (screen: {self.last_screen_rejected}"
+            if self.secagg == "hardened" and self.last_vss_rejected:
+                extra += f", failed VSS: {self.last_vss_rejected}"
             if self.class_check:
                 extra += f", class-profile check: {self.last_head_rejected}"
             if self.collusion_check:

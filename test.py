@@ -34,9 +34,14 @@ if __name__=="__main__":
                              "'dh' = real secure aggregation (Diffie-Hellman + Shamir shares), "
                              "'hardened' = Phase 1: field masks, commit-first uploads, committee "
                              "beacon sketch seed, sum check")
-    parser.add_argument('--c1-attack', choices=['none', 'sketchlie', 'nullspace'], default='none',
-                        help="test attacker against C1 itself (needs --attack signflip): 'sketchlie' = "
-                             "benign sketch + poisoned upload; 'nullspace' = poison the expected sketch cannot see")
+    parser.add_argument('--c1-attack', choices=['none', 'sketchlie', 'nullspace', 'badshare', 'badreveal'],
+                        default='none',
+                        help="test attacker against C1 itself: 'sketchlie' = benign sketch + poisoned upload; "
+                             "'nullspace' = poison the expected sketch cannot see (both need --attack signflip); "
+                             "'badshare' = malicious clients hand out wrong mask shares and ignore complaints; "
+                             "'badreveal' = malicious clients return wrong shares at unmasking")
+    parser.add_argument('--no-vss', action='store_true',
+                        help="--secagg hardened without Phase 3 (plain Shamir shares instead of Feldman VSS)")
     parser.add_argument('--class-check', action='store_true',
                         help="sketch/repsketch: also reject clients whose output-layer class profile is an outlier")
     parser.add_argument('--class-mad', type=float, default=3.0, help="class check: robust z-score cut-off")
@@ -114,7 +119,7 @@ if __name__=="__main__":
             agg_kwargs = {'sketch_dim': args.sketch_dim, 'similarity_threshold': args.sim_threshold,
                           'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0,
                           'class_check': args.class_check, 'class_mad': args.class_mad,
-                          'secagg': args.secagg, 'c1_attack': args.c1_attack,
+                          'secagg': args.secagg, 'c1_attack': args.c1_attack, 'secagg_vss': not args.no_vss,
                           'collusion_check': args.collusion_check,
                           'collusion_threshold': args.collusion_threshold,
                           'dump_screening': args.dump_screening, 'screening': args.screening}
@@ -147,6 +152,8 @@ if __name__=="__main__":
                 name += f"_prob{args.probation}"
             if args.c1_attack != 'none':
                 name += f"_c1{args.c1_attack}"
+            if args.no_vss and args.secagg == 'hardened':
+                name += "_novss"
         if args.attack_mode != 'always':
             name += f"_{args.attack_mode}{args.attack_period}"
         if args.whitewash:

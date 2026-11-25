@@ -210,7 +210,8 @@ class Task:
             writer.writerow(['round', 'global_acc', 'global_loss', 'rejected',
                              'malicious_caught', 'honest_rejected', 'backdoor_asr',
                              'attack_on', 'malicious_included', 'rej_screen', 'rej_class',
-                             'rej_collusion', 'rej_reputation', 'collusion_max_cos'])
+                             'rej_collusion', 'rej_reputation', 'collusion_max_cos', 'rej_vss',
+                             'bad_reveal_holders', 'round_discarded'])
         client_test = self.global_args.get('client_test', True)
 
         for i in range(self.global_args['communication_round']):
@@ -276,7 +277,10 @@ class Task:
                                    ('last_screen_rejected', 'last_head_rejected', 'last_collusion_rejected',
                                     'last_rep_excluded')]
                                 + [getattr(self.server, 'last_collusion_max', '')
-                                   if getattr(self.server, 'collusion_check', False) else ''])
+                                   if getattr(self.server, 'collusion_check', False) else '']
+                                + [' '.join(map(str, getattr(self.server, a, []) or [])) for a in
+                                   ('last_vss_rejected', 'last_bad_reveals')]
+                                + [int(getattr(self.server, 'last_sum_check', None) is False)])
                 f.flush()
         if writer:
             f.close()

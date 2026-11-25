@@ -174,16 +174,26 @@ class MPCScreening:
             os_.Send(sock)
 
     # ----- one round
-    def decide(self, sketches_int, profiles_int, weights, judged, coll_active):
+    def decide(self, sketches_int, profiles_int, weights, judged, coll_active, present=None):
         """sketches_int: n x k signed ints (24 fractional bits), profiles_int: n x c, weights: public
         reputation weights (or None), judged: who has been around for the collusion window,
-        coll_active: whether the collusion check runs this round. Returns three 0/1 lists."""
+        coll_active: whether the collusion check runs this round, present: clients taking part
+        this round (default all; Phase 3 leaves out clients that failed VSS). Returns three 0/1
+        lists; entries of absent clients are meaningless."""
         t0 = time.perf_counter()
         n = self.n
+        present = [True] * n if present is None else [bool(p) for p in present]
+        m = sum(present)
+        if m == 0:
+            raise ValueError("no client present")
+        lo, hi = (m - 1) // 2, m // 2
         w = [1.0] * n if weights is None else [max(float(x), 1e-12) for x in weights]
         winv = [int(round((1 << FRAC_BITS) / x)) for x in w]
-        self._send_public([1, int(coll_active)] + [int(bool(j)) for j in judged] + winv)
+        self._send_public([1, int(coll_active), lo, hi] + [int(bool(j) and p) for j, p in zip(judged, present)]
+                          + winv + [int(p) for p in present])
         for i in range(n):
+            if not present[i]:
+                continue
             vals = [int(x) for x in sketches_int[i]]
             if self.c:
                 vals += [int(x) for x in profiles_int[i]]
@@ -204,7 +214,7 @@ class MPCScreening:
     def stop(self):
         if self.coord is not None:
             try:
-                self._send_public([0] + [0] * (1 + 2 * self.n))
+                self._send_public([0] + [0] * (3 + 3 * self.n))
             except OSError:
                 pass
         for p in self.procs:

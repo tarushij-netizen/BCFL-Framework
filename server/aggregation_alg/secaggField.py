@@ -46,8 +46,12 @@ def to_field(v_int):
 
 
 def from_field(v_field):
-    """field vector -> signed integers (values are known to be small: |v| < L/2)."""
-    return np.array([int(a) if a < HALF else int(a) - L for a in v_field], dtype=np.int64)
+    """field vector -> signed integers. A correctly unmasked sum is small; a value outside int64
+    means the masks did not cancel (e.g. a wrong share was used), which is reported, not wrapped."""
+    out = [int(a) if a < HALF else int(a) - L for a in v_field]
+    if any(not -2 ** 63 <= v < 2 ** 63 for v in out):
+        raise RuntimeError("unmasked value out of range: the masks did not cancel")
+    return np.array(out, dtype=np.int64)
 
 
 def decode_int(v_int):
@@ -99,7 +103,11 @@ def null_space_project(z, h, s, k):
 class FieldSecAggRound:
     """One round among clients 0..n-1; share x-coordinate of client j is j + 1."""
 
-    def __init__(self, n, d, threshold=None):
+    def __init__(self, n, d, threshold=None, faults=None):
+        """faults (test attackers, to show gap 1): bad_share {(dealer, holder)} - the dealer hands
+        that holder a wrong share; wrong_reveal {holder} - the holder returns wrong shares.
+        Nothing here can detect either (Phase 3, secaggVSS.py, can)."""
+        self.faults = {k: set(v) for k, v in (faults or {}).items()}
         self.n, self.d = n, d
         self.t = threshold or (n // 2 + 1)
         if not 2 <= self.t <= n:
@@ -113,6 +121,8 @@ class FieldSecAggRound:
             self._b[i] = secrets.randbits(256)
             for kind, secret in (("sk", self._sk[i]), ("b", self._b[i])):
                 for x, y in shamir_share(secret, self.t, xs).items():
+                    if (i, x - 1) in self.faults.get("bad_share", ()):
+                        y = y + 1
                     self._held[x - 1][(kind, i)] = (x, y)
 
     def _mask(self, i):
@@ -133,7 +143,10 @@ class FieldSecAggRound:
         if self._revealed[holder].get(client) == other:
             raise PermissionError(f"holder {holder} already revealed {other} of client {client}")
         self._revealed[holder][client] = kind
-        return self._held[holder][(kind, client)]
+        x, y = self._held[holder][(kind, client)]
+        if holder in self.faults.get("wrong_reveal", ()):
+            y = y + 1
+        return x, y
 
     def server_unmask_sum_int(self, uploads, accepted, holders=None):
         """uploads: {i: y_i}; returns sum_{i in accepted} enc(x_i) as signed integers."""
@@ -148,6 +161,8 @@ class FieldSecAggRound:
         for i in acc:
             shares = dict(self.holder_reveal(h, "b", i) for h in holders if h != i)
             b_i = shamir_reconstruct(dict(list(shares.items())[:self.t]))
+            if b_i >= 2 ** 256:      # b_i was drawn below 2^256: a wrong share was used
+                raise RuntimeError(f"rebuilt self-mask seed of client {i} is out of range")
             total = (total - prg_field(_seed_bytes(b_i), self.d, b"self")) % L
         for j in rejected:
             shares = dict(self.holder_reveal(h, "sk", j) for h in holders if h != j)

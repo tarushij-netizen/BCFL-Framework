@@ -13,10 +13,12 @@
 #                receives the verdicts
 #
 # Per round:
-#   coordinator -> public: [continue, coll_active, judged[0..N-1], winv[0..N-1]]
+#   coordinator -> public: [continue, coll_active, lo, hi, judged[0..N-1], winv[0..N-1], present[0..N-1]]
 #       winv = round(2^24 / reputation weight) (clients pre-scale their update by the public
 #       weight; screening is done on sketch / weight, as in the plaintext rule)
-#   clients     -> private: sketch, profile
+#       present: the round's qualified clients (Phase 3); absent ones send nothing and every
+#       median is taken over the present ones, whose middle positions are lo, hi
+#   clients     -> private: sketch, profile (present clients only)
 #   MPC         -> coordinator (authenticated): screen_ok[N], class_ok[N], collusion_flag[N]
 #   coordinator -> public: accepted[0..N-1] (after reputation, outside the MPC)
 #   MPC         -> coordinator (authenticated): sum of accepted raw sketches (K integers)
@@ -69,12 +71,19 @@ def sort_list(xs):
     return xs
 
 
-def median(xs):
+def median(xs, lo, hi):
+    """Median of the present entries: absent entries carry +BIG, so they sort last; lo, hi are
+    the (public) positions of the middle of the present ones (lo == hi for an odd count)."""
     s = sort_list(xs)
-    n = len(s)
-    if n % 2:
-        return s[n // 2]
-    return (s[n // 2 - 1] + s[n // 2]) * cfix(0.5)
+    if isinstance(s[0], sfix) and s[0].size > 1:
+        S = sfix.Matrix(len(s), s[0].size)
+        for r, v in enumerate(s):
+            S[r].assign_vector(v)
+        return (S[lo].get_vector() + S[hi].get_vector()) * cfix(0.5)
+    A = sfix.Array(len(s))
+    for r, v in enumerate(s):
+        A[r] = v
+    return (A[lo] + A[hi]) * cfix(0.5)
 
 
 def dot(a, b):
@@ -98,35 +107,50 @@ print_ln('bcfl_screen: %s clients + coordinator connected', N)
 coll_hist = sfix.Matrix(max(W, 1), N * N)
 rounds_done = MemValue(regint(0))
 raw = sint.Matrix(N, K)
+prof = sint.Matrix(N, max(C, 1))
+BIG = cfix(2 ** 20)          # above any sketch coordinate, norm or profile distance
 
 
 @do_while
 def _round():
-    pub = regint.read_from_socket(regint(COORD), 2 + 2 * N)
+    pub = regint.read_from_socket(regint(COORD), 4 + 3 * N)
     cont = pub[0]
 
     @if_(cont)
     def _():
         coll_active = pub[1]
-        judged = [pub[2 + i] for i in range(N)]
-        winv = [cfix._new(cint(pub[2 + N + i])) for i in range(N)]
+        lo, hi = pub[2], pub[3]
+        judged = [pub[4 + i] for i in range(N)]
+        winv = [cfix._new(cint(pub[4 + N + i])) for i in range(N)]
+        present = [pub[4 + 2 * N + i] for i in range(N)]
+        pres = [cint(p) for p in present]
+        absent_big = [(1 - p) * BIG for p in pres]
 
-        V, P = [], []
+        # clients outside this round's qualified set (Phase 3: failed VSS) send nothing
         for i in range(N):
-            x = sint.receive_from_client(K + C, regint(i))
-            for j in range(K):
-                raw[i][j] = x[j]
-            V.append(sfix._new(sint.concat(x[:K])) * winv[i])
-            if C:
-                P.append(sfix._new(sint.concat(x[K:])))
+            @if_e(present[i])
+            def _():
+                x = sint.receive_from_client(K + C, regint(i))
+                raw[i].assign_vector(sint.concat(x[:K]))
+                if C:
+                    prof[i].assign_vector(sint.concat(x[K:]))
+
+            @else_
+            def _():
+                raw[i].assign_all(0)
+                if C:
+                    prof[i].assign_all(0)
+
+        V = [sfix._new(raw[i].get_vector()) * winv[i] for i in range(N)]
+        P = [sfix._new(prof[i].get_vector()) for i in range(N)] if C else []
 
         # ---- screening: cosine to the coordinate-wise median + norm ratio
-        m = median(V)
+        m = median([V[i] + absent_big[i] for i in range(N)], lo, hi)
         sq = [dot(v, v) for v in V]
         nrm = [mpc_math.sqrt(s) for s in sq]
         sqm = dot(m, m)
         nm = mpc_math.sqrt(sqm)
-        med_n = median(nrm)
+        med_n = median([nrm[i] + absent_big[i] for i in range(N)], lo, hi)
         screen_ok = []
         for i in range(N):
             d = dot(V[i], m)
@@ -139,10 +163,10 @@ def _round():
         # ---- class-profile check: robust z-score of the L1 distance to the median profile
         class_ok = [sint(1)] * N
         if C:
-            pm = median(P)
+            pm = median([P[i] + absent_big[i] for i in range(N)], lo, hi)
             dist = [absv(P[i] - pm).sum() for i in range(N)]
-            md = median(dist)
-            mad = median([absv(x - md) for x in dist])
+            md = median([dist[i] + absent_big[i] for i in range(N)], lo, hi)
+            mad = median([absv(dist[i] - md) * pres[i] + absent_big[i] for i in range(N)], lo, hi)
             cut = mad * cfix(1.4826 * CMAD)
             class_ok = [1 - ((dist[i] - md) > cut) for i in range(N)]
 
@@ -151,7 +175,7 @@ def _round():
         if W:
             U = []
             for i in range(N):
-                c = V[i] - m
+                c = (V[i] - m) * pres[i]             # absent: zero row, cosine 0 with everyone
                 inv = 1 / (mpc_math.sqrt(dot(c, c)) + cfix(EPS))
                 U.append(c * inv)
             g = [sfix(0)] * (N * N)
