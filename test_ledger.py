@@ -117,4 +117,26 @@ with reverts("no deal") as rv:
     L.postReveal(R, b"\x06" * 32, {"from": committee[1], "silent": True})
 check("a member that did not deal cannot reveal", rv.ok, f"({rv.detail})")
 
+# ---- hardened C1 (Phase 4): anchors of what the server relayed
+R = 9
+d0, d2 = web3.keccak(text="setup-view"), web3.keccak(text="outcome-view")
+L.postAnchor(R, 0, d0, {"from": server, "silent": True})
+check("the server anchors the setup digest while the round is open", hx(L.anchorOf(R, 0)) == hx(d0))
+with reverts("already anchored") as rv:
+    L.postAnchor(R, 0, web3.keccak(text="other"), {"from": server, "silent": True})
+check("an anchor cannot be replaced (one value for every reader)", rv.ok, f"({rv.detail})")
+with reverts("only server") as rv:
+    L.postAnchor(R, 1, d0, {"from": committee[0], "silent": True})
+check("only the server anchors", rv.ok, f"({rv.detail})")
+with reverts("round open") as rv:
+    L.postAnchor(R, 2, d2, {"from": server, "silent": True})
+check("no outcome anchor before the uploads are fixed", rv.ok, f"({rv.detail})")
+psR = [web3.keccak(text=f"pseudo-{i}-r{R}") for i in range(4)]
+L.recordRound(R, psR, hs, {"from": server, "silent": True})
+L.postAnchor(R, 2, d2, {"from": server, "silent": True})
+check("outcome anchor after the round is closed", hx(L.anchorOf(R, 2)) == hx(d2))
+with reverts("round closed") as rv:
+    L.postAnchor(R, 0, d0, {"from": server, "silent": True})
+check("no setup anchor after the round is closed", rv.ok, f"({rv.detail})")
+
 print(f"\n{passed}/{total} checks passed")

@@ -40,6 +40,11 @@ if __name__=="__main__":
                              "'nullspace' = poison the expected sketch cannot see (both need --attack signflip); "
                              "'badshare' = malicious clients hand out wrong mask shares and ignore complaints; "
                              "'badreveal' = malicious clients return wrong shares at unmasking")
+    parser.add_argument('--no-server-checks', action='store_true',
+                        help="--secagg hardened without Phase 4 (clients and holders trust what the server shows them)")
+    parser.add_argument('--server-attack', default='none',
+                        choices=['none', 'split_accepted', 'drop_deal', 'forge_complaint', 'fake_accept', 'wrong_model'],
+                        help="test attacker: a malicious server (colluding with the --num-malicious clients)")
     parser.add_argument('--no-vss', action='store_true',
                         help="--secagg hardened without Phase 3 (plain Shamir shares instead of Feldman VSS)")
     parser.add_argument('--class-check', action='store_true',
@@ -120,6 +125,7 @@ if __name__=="__main__":
                           'magnitude_ratio': args.mag_ratio, 'seed': args.seed or 0,
                           'class_check': args.class_check, 'class_mad': args.class_mad,
                           'secagg': args.secagg, 'c1_attack': args.c1_attack, 'secagg_vss': not args.no_vss,
+                          'server_checks': not args.no_server_checks, 'server_attack': args.server_attack,
                           'collusion_check': args.collusion_check,
                           'collusion_threshold': args.collusion_threshold,
                           'dump_screening': args.dump_screening, 'screening': args.screening}
@@ -154,6 +160,10 @@ if __name__=="__main__":
                 name += f"_c1{args.c1_attack}"
             if args.no_vss and args.secagg == 'hardened':
                 name += "_novss"
+            if args.server_attack != 'none':
+                name += f"_srv{args.server_attack}"
+            if args.no_server_checks and args.secagg == 'hardened':
+                name += "_nochecks"
         if args.attack_mode != 'always':
             name += f"_{args.attack_mode}{args.attack_period}"
         if args.whitewash:

@@ -211,7 +211,8 @@ class Task:
                              'malicious_caught', 'honest_rejected', 'backdoor_asr',
                              'attack_on', 'malicious_included', 'rej_screen', 'rej_class',
                              'rej_collusion', 'rej_reputation', 'collusion_max_cos', 'rej_vss',
-                             'bad_reveal_holders', 'round_discarded'])
+                             'bad_reveal_holders', 'round_discarded', 'server_alarms', 'privacy_breach',
+                             'model_alarms'])
         client_test = self.global_args.get('client_test', True)
 
         for i in range(self.global_args['communication_round']):
@@ -227,8 +228,12 @@ class Task:
             board = getattr(self.server, 'board', None)
             if board is not None and hasattr(board, 'audit'):
                 board.audit(i)          # this round's beacon log agrees with the chain
-            for client in self.client_pool:
-                client.load_state_dict(global_model)
+            if hasattr(self.server, 'deliver_global'):    # Phase 4: clients check what they get
+                delivered = self.server.deliver_global(global_model, len(self.client_pool))
+            else:
+                delivered = [global_model] * len(self.client_pool)
+            for client, gm in zip(self.client_pool, delivered):
+                client.load_state_dict(gm)
 
             res = self._evaluate_global(global_model)
             rejected = list(getattr(self.server, 'rejected_last_round', []))
@@ -280,7 +285,11 @@ class Task:
                                    if getattr(self.server, 'collusion_check', False) else '']
                                 + [' '.join(map(str, getattr(self.server, a, []) or [])) for a in
                                    ('last_vss_rejected', 'last_bad_reveals')]
-                                + [int(getattr(self.server, 'last_sum_check', None) is False)])
+                                + [int(getattr(self.server, 'last_sum_check', None) is False),
+                                   len(getattr(self.server, 'last_alarms', []) or []),
+                                   '' if getattr(self.server, 'last_privacy_breach', None) is None
+                                   else int(self.server.last_privacy_breach),
+                                   ' '.join(map(str, getattr(self.server, 'last_model_alarms', []) or []))])
                 f.flush()
         if writer:
             f.close()

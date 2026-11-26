@@ -105,6 +105,26 @@ export BCFL_MPSPDZ=~/MP-SPDZ
 python test_phase2.py
 ```
 
+### C1 Phase 3: verifiable mask shares (Feldman VSS)
+`--secagg hardened` shares each client's mask key and self-mask seed with Feldman VSS
+(`server/aggregation_alg/secaggVSS.py`): shares travel in encrypted boxes, holders complain about
+bad shares on the board, a client that does not answer is left out of the round, and every share
+revealed at unmasking is checked before use (a wrong one is dropped and its holder named).
+`--no-vss` is the Phase 1 round; `--c1-attack badshare|badreveal` attacks it. `python test_phase3.py`,
+`./run_phase3.sh`.
+
+### C1 Phase 4: malicious server
+With `--secagg hardened` every board post is signed (Ed25519, `secure/signing.py`), and the server
+anchors a digest of what it relayed at four points of the round (on chain with `--onchain`:
+`ReputationLedger.postAnchor`). Each client, holder and committee member checks its own view
+against the anchor before uploading, revealing or accepting the new global model
+(`chainfl/relay.py`). With `--screening mpc` the committee members receive the verdicts and the
+accepted-sketch total from the MPC themselves and attest them; holders reveal only for an accepted
+set those verdicts allow, and clients run the sum check publicly. `--no-server-checks` turns this
+off; `--server-attack split_accepted|drop_deal|forge_complaint|wrong_model|fake_accept` is a
+malicious server colluding with the `--num-malicious` clients. `python test_phase4.py`,
+`./run_phase4.sh`.
+
 ## Relative Article
 [1] [VeryFL Design] [VeryFL: A Verify Federated Learning Framework Embedded with Blockchain](http://106.52.19.28/resource/VeryFL.pdf)(Arxiv)
 

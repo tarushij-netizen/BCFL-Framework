@@ -169,8 +169,12 @@ class VSSSecAggRound:
       double_reveal     {holder}            holder posts both kinds of shares for every client
     """
 
-    def __init__(self, n, d, board, rnd, threshold=None, channel_keys=None, faults=None):
+    def __init__(self, n, d, board, rnd, threshold=None, channel_keys=None, faults=None, identities=None):
+        """identities (Phase 4): {i: secure.signing.Identity} of the clients. Every post is then
+        signed, and every client reads its own view of the board (chainfl/relay.py)."""
         self.n, self.d, self.board, self.rnd = n, d, board, rnd
+        self.ids = identities
+        self.alarms = []                        # EquivocationErrors raised by clients that refused
         self.t = threshold or (n // 2 + 1)
         if not 2 <= self.t <= n:
             raise ValueError(f"threshold {self.t} must be in [2, {n}]")
@@ -183,6 +187,33 @@ class VSSSecAggRound:
 
     def _f(self, name):
         return self.faults.get(name, set())
+
+    def _post(self, kind, author, key, value):
+        sig = self.ids[author].sign_post(kind, self.rnd, author, key, value) if self.ids else None
+        self.board.post(kind, self.rnd, author, key, value, sig)
+
+    def _v(self, i):
+        from chainfl.relay import view_of
+        return view_of(self.board, ("client", i))
+
+    def check_views(self, phase, readers=None):
+        """Phase 4: each client compares its view with the anchored digest. Returns the clients
+        that refuse (and records why); empty when all agree or when the board is a plain one."""
+        from chainfl.relay import EquivocationError
+        refused = []
+        for i in (range(self.n) if readers is None else readers):
+            v = self._v(i)
+            if not hasattr(v, "check"):
+                continue
+            try:
+                v.check(self.rnd, phase)
+            except EquivocationError as e:
+                self.alarms.append(e)
+                refused.append(i)
+        return refused
+
+    def upload_sig(self, i, hsh):
+        return self.ids[i].sign_post("upload_commit", self.rnd, i, i, hsh) if self.ids else None
 
     # ---------------------------------------------------------- OPEN phase
     def setup(self):
@@ -210,11 +241,12 @@ class VSSSecAggRound:
                     y_sk, y_b = (y_sk + 1) % L, (y_b + 1) % L
                 boxes[j] = self.keys[i].encrypt(self.box_pk[j], _ctx(self.rnd, i, j),
                                                 rt.scalar_bytes(y_sk) + rt.scalar_bytes(y_b))
-            self.board.post("secagg_deal", self.rnd, i, i, {"pk": pk, "C_sk": C_sk, "C_b": C_b, "boxes": boxes})
+            self._post("secagg_deal", i, i, {"pk": pk, "C_sk": C_sk, "C_b": C_b, "boxes": boxes})
 
     def holder_share(self, j, i):
         """Holder j's verified (y_sk, y_b) for client i: from its box, else from i's public answer."""
-        deals = deals_on_board(self.board, self.rnd)
+        view = self._v(j)
+        deals = deals_on_board(view, self.rnd)
         d = deals.get(i)
         if d is None:
             return None
@@ -225,34 +257,39 @@ class VSSSecAggRound:
                 return y_sk, y_b
         except Exception:
             pass
-        return opened_shares(self.board, self.rnd, deals).get((i, j))
+        return opened_shares(view, self.rnd, deals).get((i, j))
 
     def complain(self):
-        deals = deals_on_board(self.board, self.rnd)
         for j in range(self.n):
+            deals = deals_on_board(self._v(j), self.rnd)
             for i in range(self.n):
                 if i == j:
                     continue
                 bad = i not in deals or self.holder_share(j, i) is None
                 if bad or (j, i) in self._f("false_complaint"):
-                    self.board.post("secagg_complaint", self.rnd, j, (j, i), None)
+                    self._post("secagg_complaint", j, (j, i), None)
 
     def answer(self):
-        for _, (j, i), _ in self.board.entries("secagg_complaint", self.rnd):
+        for i in range(self.n):
             if i in self._f("ignore_complaints") or i not in self._shares:
                 continue
-            self.board.post("secagg_open", self.rnd, i, (i, j), self._shares[i][j])
+            for author, (j, ii), _ in self._v(i).entries("secagg_complaint", self.rnd):
+                if ii == i and author == j:
+                    self._post("secagg_open", i, (i, j), self._shares[i][j])
 
     # ---------------------------------------------------------- client upload
     def deal_of(self, i):
         return deals_on_board(self.board, self.rnd)[i]
 
     def _mask(self, i):
+        """Client i's mask, from ITS OWN view of the board (its own idea of who is in the round)."""
         if self.qualified is None:
             raise RuntimeError("setup() first")
-        deals = deals_on_board(self.board, self.rnd)
+        view = self._v(i)
+        deals = deals_on_board(view, self.rnd)
+        qual = qualified_clients(view, self.rnd, self.n, self.t)
         m = sf.prg_field(rt.scalar_bytes(self._b[i]), self.d, b"self")
-        for j in self.qualified:
+        for j in qual:
             if j == i:
                 continue
             p = sf.prg_field(pair_key(self._sk[i], deals[i]["pk"], deals[j]["pk"]), self.d, b"pair")
@@ -268,13 +305,34 @@ class VSSSecAggRound:
         return upload_hash(self.rnd, i, y_field, self.deal_of(i))
 
     # ---------------------------------------------------------- CLOSED phase
-    def holders_reveal(self, accepted, holders=None):
+    def holders_reveal(self, accepted=None, holders=None, validate=None):
         """Each online holder posts its b-shares of accepted clients and sk-shares of the
-        qualified clients that were rejected."""
-        acc = set(accepted)
-        rejected = [i for i in self.qualified if i not in acc]
+        qualified clients that were rejected.
+
+        Phase 4: a holder takes the accepted set from its own view of the board (the server's
+        signed 'round_accepted' post), after checking the 'outcome' anchor and, if given,
+        validate(j, view) (e.g. the committee's verdict attestations). A holder that finds a
+        problem reveals nothing. Without a 'round_accepted' post (plain board) the accepted set
+        passed in is used."""
+        from chainfl.relay import EquivocationError
         holders = range(self.n) if holders is None else holders
         for j in holders:
+            view = self._v(j)
+            posted = [v for a, k, v in view.entries("round_accepted", self.rnd) if k == "accepted"]
+            try:
+                if hasattr(view, "check"):
+                    view.check(self.rnd, "outcome")
+                if validate is not None:
+                    validate(j, view)
+            except EquivocationError as e:
+                self.alarms.append(e)
+                continue
+            if posted:
+                acc = set(posted[0]["accepted"] if isinstance(posted[0], dict) else posted[0])
+            else:
+                acc = set(accepted or ())
+            qual = qualified_clients(view, self.rnd, self.n, self.t)
+            rejected = [i for i in qual if i not in acc]
             for kind, clients in (("b", sorted(acc)), ("sk", rejected)):
                 for i in clients:
                     if i == j:
@@ -285,10 +343,10 @@ class VSSSecAggRound:
                     y = sh[0] if kind == "sk" else sh[1]
                     if j in self._f("wrong_reveal"):
                         y = (y + 1) % L
-                    self.board.post("secagg_reveal", self.rnd, j, (j, kind, i), y)
+                    self._post("secagg_reveal", j, (j, kind, i), y)
                     if j in self._f("double_reveal"):
                         other = sh[1] if kind == "sk" else sh[0]
-                        self.board.post("secagg_reveal", self.rnd, j, (j, "b" if kind == "sk" else "sk", i), other)
+                        self._post("secagg_reveal", j, (j, "b" if kind == "sk" else "sk", i), other)
 
     def server_unmask_sum_int(self, uploads, accepted):
         """Unmask sum_{i in accepted} enc(x_i) from the uploads and the board's revealed shares."""

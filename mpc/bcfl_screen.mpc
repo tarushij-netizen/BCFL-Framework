@@ -23,7 +23,11 @@
 #   coordinator -> public: accepted[0..N-1] (after reputation, outside the MPC)
 #   MPC         -> coordinator (authenticated): sum of accepted raw sketches (K integers)
 #
-# Compile:  ./compile.py -F 128 bcfl_screen N K C W SIM MAG CMAD CTHR GROUP
+# Phase 4: the outputs also go to OBS observer clients (ids N+1..N+OBS), one per committee
+# member, so the members see the verdicts and the total themselves and can attest them on the
+# board; the server cannot report different ones.
+#
+# Compile:  ./compile.py -F 128 bcfl_screen N K C W SIM MAG CMAD CTHR GROUP OBS
 #   C = 0 disables the class check, W = 0 disables the collusion check.
 
 from Compiler import mpc_math
@@ -31,6 +35,7 @@ from Compiler import mpc_math
 args = program.args[1:]
 N, K, C, W = int(args[0]), int(args[1]), int(args[2]), int(args[3])
 SIM, MAG, CMAD, CTHR, GROUP = float(args[4]), float(args[5]), float(args[6]), float(args[7]), int(args[8])
+OBS = int(args[9]) if len(args) > 9 else 0
 F = 24
 sfix.set_precision(F, 56)
 cfix.set_precision(F, 56)
@@ -100,7 +105,7 @@ def absv(x):
 
 
 listen_for_clients(PORT)
-for _ in range(N + 1):
+for _ in range(N + 1 + OBS):
     accept_client_connection(PORT)
 print_ln('bcfl_screen: %s clients + coordinator connected', N)
 
@@ -197,8 +202,9 @@ def _round():
             out[i] = screen_ok[i]
             out[N + i] = class_ok[i]
             out[2 * N + i] = coll_flag[i]
-        coord = regint.Array(1)
-        coord[0] = COORD
+        coord = regint.Array(1 + OBS)           # coordinator, then the committee's observers
+        for o in range(1 + OBS):
+            coord[o] = COORD + o
         sint.reveal_to_clients(coord, list(out))
 
         # ---- sum of the accepted raw sketches, for the sum check

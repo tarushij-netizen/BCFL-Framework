@@ -57,11 +57,27 @@ class ChainBoard(MemoryBoard):
         elif kind == "round_outcome":
             self._tx("postOutcome", L.postOutcome, rnd, bool(value), sender=self.inc.server)
 
-    def commit_uploads(self, rnd, hashes):
+    def commit_uploads(self, rnd, hashes, sigs=None):
         for i, hsh in enumerate(hashes):
-            self.post("upload_commit", rnd, "server", i, hsh)
+            if sigs is None or sigs[i] is None:
+                self.post("upload_commit", rnd, "server", i, hsh)
+            else:
+                self.post("upload_commit", rnd, i, i, hsh, sigs[i])
         self.inc.record_commitments(rnd, hashes)         # recordRound: closes the round on chain
         self.close(rnd)
+
+    def _on_anchor(self, rnd, phase, digest):
+        """Phase 4: the digest goes on chain (write-once per round and phase)."""
+        from chainfl.board import ANCHOR_PHASES
+        code = list(ANCHOR_PHASES).index(phase)
+        self._tx("postAnchor", self.ledger.postAnchor, rnd, code, digest, sender=self.inc.server)
+
+    def anchored(self, rnd, phase):
+        """Read the anchor from the contract, not from this copy."""
+        from chainfl.board import ANCHOR_PHASES
+        d = self.ledger.anchorOf(rnd, list(ANCHOR_PHASES).index(phase))
+        d = bytes.fromhex(_hx(d))
+        return None if d == bytes(32) else d
 
     def audit(self, rnd):
         """Raise if this log disagrees with the contract's storage for round rnd."""

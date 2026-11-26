@@ -56,7 +56,9 @@ def _load_client_lib(root):
 class MPCScreening:
     def __init__(self, n, k, c, window, sim, mag, class_mad, coll_thr, group,
                  parties=5, root=None, port=None, party_port=None, binary="malicious-shamir-party.x",
-                 log_dir=None):
+                 log_dir=None, observers=0):
+        """observers (Phase 4): number of committee observer clients that receive the same
+        authenticated outputs as the coordinator (normally one per committee member)."""
         self.n, self.k, self.c, self.window = n, k, c, window
         self.parties = parties
         self.root = os.path.abspath(root or os.environ.get("BCFL_MPSPDZ", ""))
@@ -67,10 +69,12 @@ class MPCScreening:
         self.party_port = int(party_port or os.environ.get("BCFL_MPC_PARTY_PORT", 16000))
         self.binary = binary
         self.args = [str(n), str(k), str(c), str(window), repr(float(sim)), repr(float(mag)),
-                     repr(float(class_mad)), repr(float(coll_thr)), str(int(group))]
+                     repr(float(class_mad)), repr(float(coll_thr)), str(int(group)), str(int(observers))]
+        self.observers = int(observers)
+        self.last_observed = []     # what each observer received in the last decide / sum_accepted
         self.prog = "-".join(["bcfl_screen"] + self.args)
         self.log_dir = log_dir or os.path.join(self.root, "logs-bcfl")
-        self.procs, self.clients, self.coord = [], [], None
+        self.procs, self.clients, self.coord, self.obs = [], [], None, []
         self.rounds = 0
         self.last_seconds = 0.0
         self.total_seconds = 0.0
@@ -96,7 +100,7 @@ class MPCScreening:
         one is missing."""
         pd = os.path.join(self.root, "Player-Data")
         os.makedirs(pd, exist_ok=True)
-        names = [f"P{i}" for i in range(self.parties)] + [f"C{i}" for i in range(self.n + 1)]
+        names = [f"P{i}" for i in range(self.parties)] + [f"C{i}" for i in range(self.n + 1 + self.observers)]
         marker = os.path.join(pd, ".bcfl-certs-san")
         if os.path.exists(marker) and all(os.path.exists(os.path.join(pd, f"{x}.pem")) for x in names):
             return
@@ -129,6 +133,7 @@ class MPCScreening:
         with _cwd(self.root):
             self.clients = [lib.Client(hosts, self.port, i) for i in range(self.n)]
             self.coord = lib.Client(hosts, self.port, self.n)
+            self.obs = [lib.Client(hosts, self.port, self.n + 1 + o) for o in range(self.observers)]
         self._lib = lib
         atexit.register(self.stop)
         return self
@@ -199,13 +204,22 @@ class MPCScreening:
                 vals += [int(x) for x in profiles_int[i]]
             self.clients[i].send_private_inputs(vals)
         out = self.coord.receive_outputs(3 * n)
+        self.last_observed = [o.receive_outputs(3 * n) for o in self.obs]
         self._t0 = t0
+        self.pending = True             # the program now waits for the accepted set
         return out[:n], out[n:2 * n], out[2 * n:]
 
+    def finish_round(self):
+        """If a round was stopped after decide(), close it in the MPC (nothing accepted)."""
+        if getattr(self, "pending", False):
+            self.sum_accepted([])
+
     def sum_accepted(self, accepted):
+        self.pending = False
         acc = set(accepted)
         self._send_public([1 if i in acc else 0 for i in range(self.n)])
         total = np.array(self.coord.receive_outputs(self.k), dtype=np.int64)
+        self.last_observed_total = [np.array(o.receive_outputs(self.k), dtype=np.int64) for o in self.obs]
         self.last_seconds = time.perf_counter() - self._t0
         self.total_seconds += self.last_seconds
         self.rounds += 1
@@ -222,7 +236,7 @@ class MPCScreening:
                 p.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 p.kill()
-        for cl in self.clients + ([self.coord] if self.coord else []):
+        for cl in self.clients + ([self.coord] if self.coord else []) + list(getattr(self, "obs", [])):
             for s in cl.sockets:
                 s.close()
-        self.procs, self.clients, self.coord = [], [], None
+        self.procs, self.clients, self.coord, self.obs = [], [], None, []

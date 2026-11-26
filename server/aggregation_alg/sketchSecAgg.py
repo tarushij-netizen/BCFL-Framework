@@ -25,6 +25,19 @@ What this simulation does and does not do
   with Feldman VSS. A client whose shares do not match its public commitments (and who does not
   fix them when a holder complains) is left out of the round, and a holder that returns a wrong
   share at unmasking is caught and named. secagg_vss=False is the Phase 1 round (plain Shamir).
+- server_checks (default True, hardened only; Phase 4, chainfl/relay.py): every post is signed,
+  the server anchors a digest of what it relayed at four points of the round, and every client,
+  holder and committee member checks its own view against the anchor before acting; holders
+  reveal only per the server's signed accepted set, and with --screening mpc only if it agrees
+  with the verdicts the committee itself received and attested. Clients check the global model
+  they get against the anchored hash (and, with MPC, the public sum check). A mismatch stops
+  the round. server_checks=False is Phase 3 (readers trust the server).
+- server_attack (test attacker: a malicious server, colluding with the malicious clients):
+  "split_accepted" shows half of the holders an accepted set with a victim and half one
+  without it, to collect both of the victim's secrets; "drop_deal" hides a client's deal from
+  some clients; "forge_complaint" posts complaints in honest holders' names to throw a client
+  out; "fake_accept" (MPC) accepts a client the screening rejected; "wrong_model" sends one
+  client a different global model.
 - c1_attack "badshare" / "badreveal" (malicious clients, any data attack): hand holders wrong
   shares and ignore complaints / return wrong shares at unmasking (gap 1).
 - c1_attack (test attacker against C1 itself, needs attack="signflip" so the attacker knows its
@@ -183,7 +196,8 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                  rep_penalty=0.5, class_check=False, class_mad=3.0, secagg="sim", secagg_threshold=None,
                  c1_attack="none", beacon_n=5, beacon_t=3, probation=0, collusion_check=False,
                  collusion_window=3, collusion_threshold=0.5, collusion_group=3, dump_screening=None,
-                 screening="plain", secagg_vss=True, model=None, args=None):
+                 screening="plain", secagg_vss=True, server_checks=True, server_attack="none",
+                 model=None, args=None):
         ServerAggregator.__init__(self, model, args)
         if secagg not in ("sim", "dh", "hardened"):
             raise ValueError(f"secagg must be 'sim', 'dh' or 'hardened', got {secagg!r}")
@@ -202,6 +216,23 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self._coll_rounds = 0
         self.c1_attack = c1_attack
         self.secagg_vss = secagg_vss
+        if server_attack not in ("none", "split_accepted", "drop_deal", "forge_complaint", "fake_accept", "wrong_model"):
+            raise ValueError(f"unknown server_attack {server_attack!r}")
+        if server_attack == "fake_accept" and screening == "plain":
+            raise ValueError("server_attack='fake_accept' needs --screening mpc (with plaintext screening the "
+                             "server decides the verdicts itself)")
+        self.server_checks = server_checks
+        self.server_attack = server_attack
+        self.relay = None            # RelayBoard (Phase 4) around self.board
+        self._ids = None             # {'client': {i: Identity}, 'member': {m: Identity}, 'server': Identity}
+        self.last_alarms = []        # equivocation alarms raised this round (Phase 4)
+        self.alarm_rounds = 0
+        self.last_privacy_breach = None   # split_accepted attack: did the server recover the victim's update?
+        self.privacy_breaches = 0
+        self.last_model_alarms = []  # clients whose received global model failed the check
+        self._verdict_bits = None
+        self._attest_total = None
+        self._aborted = set()
         self._box_keys = None        # clients' long-term box keys (X25519), made on the first VSS round
         self.last_vss_rejected = []  # clients left out of the round by VSS (Phase 3)
         self.last_bad_reveals = []   # holders caught returning a wrong share
@@ -349,11 +380,13 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             self.mpc = MPCScreening(n, self.k, c, self.collusion_window if self.collusion_check else 0,
                                     self.similarity_threshold, self.magnitude_ratio, self.class_mad,
                                     self.collusion_threshold, self.collusion_group,
-                                    parties=self.beacon_n).start()
+                                    parties=self.beacon_n,
+                                    observers=len(self.beacon.members) if self.relay is not None else 0).start()
         judged, active = self._collusion_public(n, absent) if self.collusion_check else ([False] * n, False)
         prof_ints = [sf.encode_int(p) for p in profiles] if self.mpc.c else None
         present = [i not in absent for i in range(n)]
         s_ok, c_ok, flag = self.mpc.decide(sketch_ints, prof_ints, weights, judged, active, present)
+        self._verdict_bits = [int(x) for x in s_ok] + [int(x) for x in c_ok] + [int(x) for x in flag]
         return [bool(x) for x in s_ok], [bool(x) for x in c_ok], [bool(x) for x in flag]
 
     def _dump(self, sketches, profiles, n, ages_before, accepted, sketch_ints, weights):
@@ -420,6 +453,192 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         x = cover + sf.null_space_project(u - cover, h.astype(np.int64), s, self.k)
         return x, x
 
+    def _ensure_phase4(self, n):
+        """Identities, registry and the relayed board (Phase 4). Plain board when hardened mode
+        runs without VSS (Phase 1)."""
+        if self.relay is not None or not self.secagg_vss:
+            return
+        from chainfl.relay import RelayBoard, Registry
+        from secure.signing import Identity
+        members = list(self.beacon.members)
+        self._ids = {"client": {i: Identity() for i in range(n)},
+                     "member": {m: Identity() for m in members}, "server": Identity()}
+        reg = Registry({i: k.pk for i, k in self._ids["client"].items()},
+                       {m: k.pk for m, k in self._ids["member"].items()}, self._ids["server"].pk)
+        self.relay = RelayBoard(self.board, reg, verify=self.server_checks)
+        self.beacon.board = self.relay
+        self.beacon.ids = self._ids["member"]
+
+    def _server_post(self, kind, rnd, key, value):
+        sig = self._ids["server"].sign_post(kind, rnd, "server", key, value)
+        self.relay.post(kind, rnd, "server", key, value, sig)
+
+    def _member_post(self, kind, rnd, m, key, value):
+        sig = self._ids["member"][m].sign_post(kind, rnd, m, key, value)
+        self.relay.post(kind, rnd, m, key, value, sig)
+
+    def _victim(self, n, among=None):
+        honest = [i for i in range(n) if i not in set(getattr(self, "malicious", []))]
+        pool = [i for i in honest if among is None or i in among]
+        return pool[0] if pool else None
+
+    def _install_server_attack(self, rnd, n):
+        """Malicious server, before the round's setup: what each reader is shown."""
+        if self.relay is None or self.server_attack == "none":
+            return
+        from secure.signing import Identity
+        v = self._victim(n)
+        if self.server_attack == "drop_deal":
+            honest = [i for i in range(n) if i not in set(getattr(self, "malicious", [])) and i != v]
+            for i in honest[len(honest) // 2:]:
+                self.relay.hide_from(("client", i), lambda kind, r, a, k, val, v=v, rnd=rnd:
+                                     kind == "secagg_deal" and r == rnd and a == v)
+        elif self.server_attack == "forge_complaint":
+            fake = Identity()                       # the server has no honest holder's key
+            others = [j for j in range(n) if j != v][: self.secagg_threshold or (n // 2 + 1)]
+            for j in others:                        # complaints "from" t holders against honest client v
+                self.relay.post("secagg_complaint", rnd, j, (j, v), None,
+                                fake.sign_post("secagg_complaint", rnd, j, (j, v), None))
+
+    def _client_checks(self, rnd, phase, frnd):
+        refused = frnd.check_views(phase)
+        return refused
+
+    def _attestation_validator(self, rnd, n, qualified):
+        """Holder-side check of the accepted set against the committee's attestations (MPC)."""
+        from chainfl.relay import EquivocationError
+        from secure.signing import canon
+        t = self.beacon.t
+
+        def validate(j, view):
+            posts = [v for a, k, v in view.entries("round_accepted", rnd) if k == "accepted"]
+            if not posts:
+                raise EquivocationError(("client", j), rnd, "outcome", "no accepted set posted")
+            post = posts[0]
+            bits = post.get("verdicts")
+            if bits is None:
+                return                                  # plaintext screening: server-trusted
+            dig = hashlib.sha256(b"bcfl-verdicts|" + canon(bits)).digest()
+            att = [m for a, (k, m), v in view.entries("verdict_attest", rnd) if k == "verdicts" and a == m and v == dig]
+            if len(set(att)) < t:
+                raise EquivocationError(("client", j), rnd, "outcome",
+                                        f"verdicts attested by {len(set(att))} committee members, need {t}")
+            ok = {i for i in post.get("present", range(n))
+                  if bits[i] and bits[n + i] and not bits[2 * n + i]}
+            if not set(post["accepted"]) <= ok:
+                raise EquivocationError(("client", j), rnd, "outcome",
+                                        f"accepted set has clients the screening rejected: "
+                                        f"{sorted(set(post['accepted']) - ok)}")
+        return validate
+
+    def _try_recover(self, frnd, v, uploads, malicious):
+        """split_accepted attack, server side: with the shares the honest holders revealed plus
+        everything the colluding clients hold, rebuild both secrets of victim v and unmask its
+        individual upload. Returns the recovered integer update or None."""
+        from secure import vss as _vss
+        from secure import ristretto as _rt
+        from .secaggVSS import deals_on_board, pair_key
+        board = self.relay
+        deals = deals_on_board(board, frnd.rnd)
+        shares = {"b": {}, "sk": {}}
+        for a, (j, kind, i), y in board.entries("secagg_reveal", frnd.rnd):
+            if i == v and a == j:
+                shares[kind][j + 1] = y
+        for j in malicious:                            # colluding holders give theirs
+            sh = frnd.holder_share(j, v)
+            if sh is not None:
+                shares["sk"][j + 1], shares["b"][j + 1] = sh
+        if len(shares["b"]) < frnd.t or len(shares["sk"]) < frnd.t:
+            return None
+        b = _vss.reconstruct(dict(list(shares["b"].items())[:frnd.t]))
+        skv = _vss.reconstruct(dict(list(shares["sk"].items())[:frnd.t]))
+        if _rt.g_mul(skv) != deals[v]["pk"]:
+            return None
+        y = (uploads[v] - sf.prg_field(_rt.scalar_bytes(b), frnd.d, b"self")) % sf.L
+        for j in frnd.qualified:
+            if j == v:
+                continue
+            p = sf.prg_field(pair_key(skv, deals[v]["pk"], deals[j]["pk"]), frnd.d, b"pair")
+            y = (y - p) % sf.L if j > v else (y + p) % sf.L
+        return sf.from_field(y)
+
+    @staticmethod
+    def model_hash(state, keys=None):
+        """Hash of a global model as clients receive it (every float tensor, in key order)."""
+        h = hashlib.sha256(b"bcfl-model|")
+        for k in (keys or list(state.keys())):
+            a = np.ascontiguousarray(_to_numpy(state[k]))
+            h.update(k.encode() + str(a.dtype).encode() + str(a.shape).encode() + a.tobytes())
+        return h.digest()
+
+    def _post_aggregate(self, agg, keys, updated):
+        """Phase 4, server: the round's aggregate (the unmasked sum is public anyway: it is the
+        model update) and the hash of the new global model, then the 'final' anchor."""
+        if self.relay is None or (self.round - 1) in getattr(self, "_aborted", set()):
+            return
+        rnd = self.round - 1
+        self._model_keys = keys
+        value = {"model": self.model_hash(agg, keys), "updated": bool(updated)}
+        if updated:
+            value["sum"] = [int(x) for x in self._last_sum_int]
+            value["denom"] = repr(float(self._last_denom))
+            value["total"] = None if self._attest_total is None else [int(x) for x in self._attest_total]
+        try:
+            self._server_post("aggregate", rnd, "aggregate", value)
+            self.relay.anchor_phase(rnd, "final")
+        except Exception as e:  # noqa: BLE001 - e.g. the round was stopped before closing
+            logger.info(f"[sketchSecAgg] round {rnd}: no aggregate posted ({e})")
+        self._attest_total = None
+
+    def deliver_global(self, agg, n):
+        """Phase 4: the server sends each client the global model; each client checks it against
+        the anchored hash (and, with MPC screening, that the posted sum passes the public sum
+        check against the committee-attested total). Returns the model each client ends up with
+        and records the clients that caught a wrong one (they then take the anchored model,
+        which any honest party can serve)."""
+        self.last_model_alarms = []
+        rnd = self.round - 1
+        if self.relay is None or rnd in self._aborted:
+            return [agg] * n                    # stopped round: everyone keeps the previous model
+        keys = getattr(self, "_model_keys", None) or list(agg.keys())
+        out = []
+        for i in range(n):
+            sent = agg
+            if self.server_attack == "wrong_model" and i == self._victim(n):
+                sent = OrderedDict((k, v.clone() if hasattr(v, "clone") else np.array(v, copy=True))
+                                   for k, v in agg.items())
+                k0 = keys[0]
+                sent[k0] = sent[k0] + 0.5
+            if self.server_checks and not self._client_accepts_model(i, rnd, sent, keys):
+                self.last_model_alarms.append(i)
+                sent = agg
+            out.append(sent)
+        if self.last_model_alarms:
+            print(f"[sketchSecAgg] round {rnd}: clients {self.last_model_alarms} received a global model "
+                  f"that does not match the anchored hash and refused it")
+        return out
+
+    def _client_accepts_model(self, i, rnd, model, keys):
+        from chainfl.relay import EquivocationError
+        from secure.signing import canon
+        view = self.relay.view(("client", i))
+        try:
+            view.check(rnd, "final")
+        except EquivocationError:
+            return False
+        posts = [v for a, k, v in view.entries("aggregate", rnd) if k == "aggregate"]
+        if len(posts) != 1 or posts[0]["model"] != self.model_hash(model, keys):
+            return False
+        post = posts[0]
+        if post.get("updated") and post.get("total") is not None:      # public sum check (MPC)
+            dig = hashlib.sha256(b"bcfl-total|" + canon(post["total"])).digest()
+            att = {m for a, (k, m), v in view.entries("verdict_attest", rnd) if k == "total" and a == m and v == dig}
+            h, s = self._round_hs
+            if len(att) < self.beacon.t or not sf.sum_check_total(np.array(post["sum"], dtype=np.int64), post["total"],
+                                                                   h, s, self.k):
+                return False
+        return True
+
     def _ensure_board(self):
         if self.board is None:
             from chainfl.board import MemoryBoard
@@ -449,7 +668,9 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             profiles = [self._profile(m, w_key, b_key, n_cls) if self.class_check else None for m in models]
             mean_update, accepted, sims, ratios = self._hardened_round(models, keys, ref, d, n, weights,
                                                                         profiles, (h, s))
-            return self._finish_round(mean_update, accepted, sims, ratios, models, keys, ref, n, None)
+            agg = self._finish_round(mean_update, accepted, sims, ratios, models, keys, ref, n, None)
+            self._post_aggregate(agg, keys, mean_update is not None)
+            return agg
 
         # client side (each client computes its own package from its own update)
         t0 = time.perf_counter()
@@ -481,25 +702,51 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         rows = np.linalg.norm(np.hstack([dw, db]), axis=1)
         return rows / (rows.sum() + 1e-12)
 
+    def _abort_round(self, rnd, alarms, t0, why):
+        """Phase 4: honest parties refused to go on; nothing from this round is used."""
+        self.last_alarms = [str(a) for a in alarms]
+        self.alarm_rounds += 1
+        self._aborted.add(rnd)
+        if self.mpc is not None:
+            self.mpc.finish_round()
+        self.last_sum_check = False
+        self.sum_check_failures += 1
+        print(f"[sketchSecAgg] round {rnd}: SERVER MISBEHAVIOUR DETECTED ({why}); "
+              f"{len(alarms)} alarm(s), e.g. {alarms[0]}; round stopped")
+        self.last_secagg_seconds = time.perf_counter() - t0
+        return None, [], [], []
+
     def _hardened_round(self, models, keys, ref, d, n, weights, profiles, guessed_hs):
-        """Phase 1 + 3 round: VSS setup -> commit uploads -> beacon seed -> sketches -> screening ->
-        unmask the accepted sum -> sum check. Client and server steps are kept apart as in the
-        other modes."""
+        """Phase 1 + 3 + 4 round: VSS setup -> anchor -> commit uploads -> beacon seed ->
+        sketches -> screening -> signed accepted set (+ committee attestations) -> anchor ->
+        holders reveal -> unmask -> sum check. Client and server steps are kept apart as in the
+        other modes; with Phase 4 every reader goes through its own view of the relayed board."""
         t0 = time.perf_counter()
         self._ensure_board()
+        self._ensure_phase4(n)
         rnd = self.round
+        self.last_alarms, self.last_privacy_breach = [], None
+        board = self.relay if self.relay is not None else self.board
         faults = self._share_faults(n)
+        self._install_server_attack(rnd, n)
         self.beacon.run_open_phase(rnd)                 # beacon deals while uploads are open
         if self.secagg_vss:
-            from .secaggVSS import VSSSecAggRound, upload_hash as vss_upload_hash
+            from .secaggVSS import VSSSecAggRound
             if self._box_keys is None:
                 from secure.channel import KeyPair
                 self._box_keys = {i: KeyPair() for i in range(n)}
-            frnd = VSSSecAggRound(n, d, self.board, rnd, self.secagg_threshold, self._box_keys, faults)
+            frnd = VSSSecAggRound(n, d, board, rnd, self.secagg_threshold, self._box_keys, faults,
+                                  identities=self._ids["client"] if self._ids else None)
             qualified = frnd.setup()                    # deals, complaints, answers: on the board
         else:
             frnd = sf.FieldSecAggRound(n, d, self.secagg_threshold, faults)
             qualified = list(range(n))
+        if self.relay is not None:                      # Phase 4: anchor setup; clients check it
+            self.relay.anchor_phase(rnd, "setup")
+            if self.server_checks:
+                frnd.check_views("setup")
+                if frnd.alarms:
+                    return self._abort_round(rnd, frnd.alarms, t0, "clients' views of the setup differ from the anchor")
         absent = [i for i in range(n) if i not in qualified]
         self.last_vss_rejected = absent
         self.vss_rejections += len(absent)
@@ -517,8 +764,19 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                 return hashlib.sha256(b"bcfl-absent|" + int(rnd).to_bytes(8, "big") + int(i).to_bytes(4, "big")).digest()
             return frnd.upload_hash(i, uploads[i]) if self.secagg_vss else sf.upload_hash(rnd, i, uploads[i])
         hashes = [commitment(i) for i in range(n)]
-        self.board.commit_uploads(rnd, hashes)          # uploads fixed; round closed
-        seed = self.beacon.run_closed_phase(rnd)        # only now is the sketch defined
+        sigs = None
+        if self._ids is not None:                       # Phase 4: each client signs its own commitment
+            sigs = [frnd.upload_sig(i, hashes[i]) if i in uploads else None for i in range(n)]
+        board.commit_uploads(rnd, hashes, sigs)         # uploads fixed; round closed
+        if self.relay is not None:
+            self.relay.anchor_phase(rnd, "uploads")
+        try:
+            seed = self.beacon.run_closed_phase(rnd)    # only now is the sketch defined
+        except RuntimeError as e:
+            if self.beacon.alarms:
+                alarms, self.beacon.alarms = self.beacon.alarms, []
+                return self._abort_round(rnd, [a for _, a in alarms], t0, f"committee refused to reveal ({e})")
+            raise
         h, s = sf.sketch_params_from_seed(seed, d, self.k)
         sketches = []
         for i in range(n):                              # client side: report a sketch
@@ -528,21 +786,65 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             honest = self.c1_attack == "nullspace" or not self._attacking(i)
             sketches.append(sf.sketch_int(x_ints[i] if honest else cover_ints[i], h, s, self.k))
         # server side: check uploads against the board, screen, unmask, check the sum
-        posted = self.board.upload_commitments(rnd)
+        posted = board.upload_commitments(rnd)
         for i in qualified:
             if commitment(i) != posted[i]:
                 raise RuntimeError(f"round {rnd}: client {i}'s upload does not match its commitment")
         wts = [1.0] * n if weights is None else [max(w, 1e-12) for w in weights]
         float_sketches = [sf.decode_int(sketches[i]) / wts[i] for i in range(n)]
+        self._verdict_bits = None
         accepted, sims, ratios = self._decide(float_sketches, profiles, n, sketches, weights, absent=set(absent))
         self.last_update_hashes = hashes
         self.last_sum_check = None
         self.last_bad_reveals = []
+
+        if self.relay is not None:                      # Phase 4: outcome, attestations, anchor
+            from secure.signing import canon
+            bits = self._verdict_bits
+            post = {"accepted": sorted(accepted), "present": sorted(qualified),
+                    "verdicts": None if bits is None else [int(b) for b in bits]}
+            if bits is not None:                        # committee members attest what they received
+                for o, m in enumerate(self.beacon.members):
+                    seen = [int(x) for x in self.mpc.last_observed[o]]
+                    dig = hashlib.sha256(b"bcfl-verdicts|" + canon(seen)).digest()
+                    self._member_post("verdict_attest", rnd, m, ("verdicts", m), dig)
+            if self.server_attack == "fake_accept":     # accept a client the screening rejected
+                rej = [i for i in qualified if i not in accepted]
+                if rej:
+                    post["accepted"] = sorted(accepted + rej[:1])
+                    accepted = post["accepted"]
+            self._server_post("round_accepted", rnd, "accepted", post)
+            anchor_view = "server"
+            victim = None
+            if self.server_attack == "split_accepted":
+                victim = self._victim(n, among=accepted)
+                if victim is not None:
+                    other = dict(post, accepted=[i for i in post["accepted"] if i != victim])
+                    self._server_post("round_accepted", rnd, "accepted", other)
+                    mal = set(getattr(self, "malicious", []))
+                    honest = [j for j in range(n) if j not in mal and j != victim]
+                    group_b = honest[len(honest) // 2:]
+                    for j in range(n):                  # everyone else (incl. colluders) sees version A
+                        self.relay.show_version(("client", j), "round_accepted", rnd, 1 if j in group_b else 0)
+                    anchor_view = ("client", honest[0])
+            self.relay.anchor_phase(rnd, "outcome", as_seen_by=anchor_view)
+
         mean = None
         if accepted:
             try:
                 if self.secagg_vss:
-                    frnd.holders_reveal(accepted)       # shares go on the board (closed phase)
+                    validate = (self._attestation_validator(rnd, n, qualified)
+                                if self.relay is not None and self.server_checks else None)
+                    frnd.holders_reveal(accepted, validate=validate)   # shares go on the board
+                    if self.server_attack == "split_accepted" and victim is not None:
+                        rec = self._try_recover(frnd, victim, uploads, set(getattr(self, "malicious", [])))
+                        self.last_privacy_breach = rec is not None and np.array_equal(rec, x_ints[victim])
+                        self.privacy_breaches += int(self.last_privacy_breach)
+                        if self.last_privacy_breach:
+                            print(f"[sketchSecAgg] round {rnd}: PRIVACY BREACH: the server rebuilt both secrets "
+                                  f"of client {victim} and recovered its individual update")
+                    if frnd.alarms and self.server_checks:
+                        return self._abort_round(rnd, frnd.alarms, t0, "holders refused to reveal")
                     sum_int = frnd.server_unmask_sum_int(uploads, accepted)
                     self.last_bad_reveals = sorted(frnd.bad_reveals)
                 else:
@@ -554,21 +856,35 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                 print(f"[sketchSecAgg] round {rnd}: UNMASKING FAILED ({e}); round discarded")
                 sum_int = None
             if sum_int is not None:
+                self._last_sum_int = sum_int
                 if self.screening in ("mpc", "mpc-check"):
                     # the committee reveals only the sum of the accepted sketches
                     total = self.mpc.sum_accepted(accepted)
+                    self._attest_total = total
+                    if self.relay is not None:
+                        from secure.signing import canon
+                        for o, m in enumerate(self.beacon.members):
+                            seen = [int(x) for x in self.mpc.last_observed_total[o]]
+                            dig = hashlib.sha256(b"bcfl-total|" + canon(seen)).digest()
+                            self._member_post("verdict_attest", rnd, m, ("total", m), dig)
                     self.last_sum_check = sf.sum_check_total(sum_int, total, h, s, self.k)
                     self.last_mpc_seconds = self.mpc.last_seconds
                 else:
                     self.last_sum_check = sf.sum_check(sum_int, sketches, accepted, h, s, self.k)
                 if self.last_sum_check:
                     denom = len(accepted) if weights is None else sum(weights[i] for i in accepted)
+                    self._last_denom = denom
                     mean = sf.decode_int(sum_int) / denom
                 else:
                     self.sum_check_failures += 1
                     print(f"[sketchSecAgg] round {rnd}: SUM CHECK FAILED: the accepted sketches do not add up "
                           f"to the sketch of the unmasked sum; round discarded, previous global model kept")
-            self.board.post("round_outcome", rnd, "server", "sum_check", bool(self.last_sum_check))
+            board.post("round_outcome", rnd, "server", "sum_check", bool(self.last_sum_check),
+                       *(() if self._ids is None else (self._ids["server"].sign_post(
+                           "round_outcome", rnd, "server", "sum_check", bool(self.last_sum_check)),)))
+        self._round_hs = (h, s)
+        if self.mpc is not None:
+            self.mpc.finish_round()                     # unmasking failed: close the MPC round too
         if self.last_bad_reveals:
             print(f"[sketchSecAgg] round {rnd}: holders {self.last_bad_reveals} returned shares that fail "
                   f"the VSS check; their shares were not used")

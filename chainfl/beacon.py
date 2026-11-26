@@ -38,10 +38,14 @@ def _ctx(rnd, j, m):
 class BeaconCommittee:
     """The n members (indices 1..n) of the C2 committee, acting as beacon dealers."""
 
-    def __init__(self, board, n=5, t=3, faults=None):
+    def __init__(self, board, n=5, t=3, faults=None, identities=None):
+        """identities (Phase 4): {m: secure.signing.Identity}; every post is then signed, every
+        member reads its own view of the board, and checks the 'setup' anchor before revealing."""
         if not 1 <= t <= n:
             raise ValueError("need 1 <= t <= n")
         self.board, self.n, self.t = board, n, t
+        self.ids = identities
+        self.alarms = []        # (member, EquivocationError) raised by members that refused
         self.members = list(range(1, n + 1))
         self.keys = {m: KeyPair() for m in self.members}
         self.public_keys = {m: k.pk for m, k in self.keys.items()}
@@ -52,6 +56,14 @@ class BeaconCommittee:
 
     def _f(self, name):
         return self.faults.get(name, set())
+
+    def _post(self, kind, rnd, author, key, value):
+        sig = self.ids[author].sign_post(kind, rnd, author, key, value) if self.ids else None
+        self.board.post(kind, rnd, author, key, value, sig)
+
+    def _v(self, m):
+        from chainfl.relay import view_of
+        return view_of(self.board, ("member", m))
 
     # ------------------------------------------------------------------ OPEN phase
     def run_open_phase(self, rnd):
@@ -70,11 +82,12 @@ class BeaconCommittee:
                 if (j, m) in self._f("bad_share"):
                     y = (y + 1) % rt.L
                 boxes[m] = self.keys[j].encrypt(self.public_keys[m], _ctx(rnd, j, m), rt.scalar_bytes(y))
-            self.board.post("beacon_deal", rnd, j, j, {"commitments": commitments, "boxes": boxes})
+            self._post("beacon_deal", rnd, j, j, {"commitments": commitments, "boxes": boxes})
 
     def _my_share(self, rnd, m, j):
         """Member m's share of dealer j's secret: from its box, else from j's public answer."""
-        deal = deals_on_board(self.board, rnd).get(j)
+        view = self._v(m)
+        deal = deals_on_board(view, rnd).get(j)
         if deal is None:
             return None
         try:
@@ -83,26 +96,28 @@ class BeaconCommittee:
                 return y
         except Exception:
             pass
-        for _, (jj, mm), y in self.board.entries("beacon_open", rnd):
-            if jj == j and mm == m and vss.verify(m, y, deal["commitments"]):
+        for author, (jj, mm), y in view.entries("beacon_open", rnd):
+            if author == jj == j and mm == m and vss.verify(m, y, deal["commitments"]):
                 return y
         return None
 
     def complain(self, rnd):
-        deals = deals_on_board(self.board, rnd)
         for m in self.members:
+            deals = deals_on_board(self._v(m), rnd)
             for j in self.members:
                 if j == m:
                     continue
                 bad = j not in deals or self._my_share(rnd, m, j) is None
                 if bad or (m, j) in self._f("false_complaint"):
-                    self.board.post("beacon_complaint", rnd, m, (m, j), None)
+                    self._post("beacon_complaint", rnd, m, (m, j), None)
 
     def answer(self, rnd):
-        for _, (m, j), _ in self.board.entries("beacon_complaint", rnd):
+        for j in self.members:
             if j in self._f("ignore_complaints") or (rnd, j) not in self._secret:
                 continue
-            self.board.post("beacon_open", rnd, j, (j, m), self._secret[(rnd, j)][1][m])
+            for author, (m, jj), _ in self._v(j).entries("beacon_complaint", rnd):
+                if jj == j and author == m:
+                    self._post("beacon_open", rnd, j, (j, m), self._secret[(rnd, j)][1][m])
 
     # ------------------------------------------------------------------ CLOSED phase
     def run_closed_phase(self, rnd):
@@ -111,14 +126,27 @@ class BeaconCommittee:
         self.reconstruct(rnd)
         return seed_from_board(self.board, rnd, self.n, self.t)
 
+    def _refuses(self, m, rnd):
+        """Phase 4: member m checks its view of the round's setup against the anchor."""
+        from chainfl.relay import EquivocationError
+        view = self._v(m)
+        if not hasattr(view, "check"):
+            return False
+        try:
+            view.check(rnd, "setup")
+            return False
+        except EquivocationError as e:
+            self.alarms.append((m, e))
+            return True
+
     def reveal(self, rnd):
         for j in qualified_dealers(self.board, rnd, self.n, self.t):
-            if j in self._f("withhold"):
+            if j in self._f("withhold") or self._refuses(j, rnd):
                 continue
             s_j = self._secret[(rnd, j)][0]
             if j in self._f("wrong_reveal"):
                 s_j = (s_j + 1) % rt.L
-            self.board.post("beacon_reveal", rnd, j, j, s_j)
+            self._post("beacon_reveal", rnd, j, j, s_j)
 
     def reconstruct(self, rnd):
         deals = deals_on_board(self.board, rnd)
@@ -127,11 +155,11 @@ class BeaconCommittee:
             if j in revealed:
                 continue
             for m in self.members:
-                if m == j:
+                if m == j or self._refuses(m, rnd):
                     continue      # a dealer that withholds does not help rebuild its own secret
                 y = self._my_share(rnd, m, j)
                 if y is not None:
-                    self.board.post("beacon_recon", rnd, m, (j, m), y)
+                    self._post("beacon_recon", rnd, m, (j, m), y)
 
 
 # ---------------------------------------------------------------------- public verification

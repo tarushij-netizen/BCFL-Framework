@@ -66,6 +66,10 @@ contract ReputationLedger {
     mapping(uint256 => bool) public roundClosed;
     mapping(uint256 => mapping(address => bytes32)) public dealHash;
     mapping(uint256 => mapping(address => bytes32)) public revealOf;
+    // C1 Phase 4: digest of the posts the server relayed, per round and phase
+    // (0 setup, 1 uploads, 2 outcome, 3 final); write-once, so every reader compares against
+    // the same value.
+    mapping(uint256 => mapping(uint8 => bytes32)) public anchorOf;
 
     event Registered(bytes32 indexed id, address payout);
     event RoundRecorded(uint256 indexed round, uint256 n);
@@ -80,6 +84,7 @@ contract ReputationLedger {
     event BeaconReveal(uint256 indexed round, address indexed dealer, bytes32 secret);
     event BeaconRecon(uint256 indexed round, address indexed member, address indexed dealer, bytes32 share);
     event RoundOutcome(uint256 indexed round, bool sumCheck);
+    event Anchor(uint256 indexed round, uint8 phase, bytes32 digest);
 
     modifier onlyServer() {
         require(msg.sender == server, "only server");
@@ -179,6 +184,16 @@ contract ReputationLedger {
         require(roundClosed[round], "round open");
         require(dealHash[round][dealer] != bytes32(0), "no deal");
         emit BeaconRecon(round, msg.sender, dealer, share);
+    }
+
+    function postAnchor(uint256 round, uint8 phase, bytes32 digest) external onlyServer {
+        require(phase < 4, "bad phase");
+        require(digest != bytes32(0), "empty digest");
+        require(anchorOf[round][phase] == bytes32(0), "already anchored");
+        if (phase >= 2) require(roundClosed[round], "round open");
+        else if (phase == 0) require(!roundClosed[round], "round closed");
+        anchorOf[round][phase] = digest;
+        emit Anchor(round, phase, digest);
     }
 
     function postOutcome(uint256 round, bool sumCheck) external onlyServer {
