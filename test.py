@@ -34,12 +34,17 @@ if __name__=="__main__":
                              "'dh' = real secure aggregation (Diffie-Hellman + Shamir shares), "
                              "'hardened' = Phase 1: field masks, commit-first uploads, committee "
                              "beacon sketch seed, sum check")
-    parser.add_argument('--c1-attack', choices=['none', 'sketchlie', 'nullspace', 'badshare', 'badreveal'],
+    parser.add_argument('--c1-attack', choices=['none', 'sketchlie', 'nullspace', 'badshare', 'badreveal',
+                                                'commitlie', 'pairlie'],
                         default='none',
                         help="test attacker against C1 itself: 'sketchlie' = benign sketch + poisoned upload; "
                              "'nullspace' = poison the expected sketch cannot see (both need --attack signflip); "
                              "'badshare' = malicious clients hand out wrong mask shares and ignore complaints; "
-                             "'badreveal' = malicious clients return wrong shares at unmasking")
+                             "'badreveal' = malicious clients return wrong shares at unmasking; 'commitlie' = commit "
+                             "to and report a harmless cover update, upload the poisoned one; 'pairlie' = the same, "
+                             "also bending one pair-mask commitment (these need --attack signflip)")
+    parser.add_argument('--no-zk', action='store_true',
+                        help="--secagg hardened without Phase 5 (no commitments or proofs)")
     parser.add_argument('--no-server-checks', action='store_true',
                         help="--secagg hardened without Phase 4 (clients and holders trust what the server shows them)")
     parser.add_argument('--server-attack', default='none',
@@ -126,6 +131,7 @@ if __name__=="__main__":
                           'class_check': args.class_check, 'class_mad': args.class_mad,
                           'secagg': args.secagg, 'c1_attack': args.c1_attack, 'secagg_vss': not args.no_vss,
                           'server_checks': not args.no_server_checks, 'server_attack': args.server_attack,
+                          'secagg_zk': not args.no_zk,
                           'collusion_check': args.collusion_check,
                           'collusion_threshold': args.collusion_threshold,
                           'dump_screening': args.dump_screening, 'screening': args.screening}
@@ -164,6 +170,8 @@ if __name__=="__main__":
                 name += f"_srv{args.server_attack}"
             if args.no_server_checks and args.secagg == 'hardened':
                 name += "_nochecks"
+            if args.no_zk and args.secagg == 'hardened':
+                name += "_nozk"
         if args.attack_mode != 'always':
             name += f"_{args.attack_mode}{args.attack_period}"
         if args.whitewash:

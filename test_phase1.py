@@ -196,8 +196,9 @@ def round_models(seed, n_mal, base, scale=5.0):
     return out
 
 
-def run(secagg, c1_attack, n_mal=3, rounds=1, reputation=False):
-    ag = sk.sketchSecAggAggregator(sketch_dim=K, seed=0, secagg=secagg, c1_attack=c1_attack, reputation=reputation)
+def run(secagg, c1_attack, n_mal=3, rounds=1, reputation=False, zk=True):
+    ag = sk.sketchSecAggAggregator(sketch_dim=K, seed=0, secagg=secagg, c1_attack=c1_attack, reputation=reputation,
+                                   secagg_zk=zk)
     ag.malicious, ag.attack, ag.attack_scale = list(range(n_mal)), "signflip", 5.0
     ag.set_global_model(prev) if hasattr(ag, "set_global_model") else None
     ag.reference_model = {k: v.copy() for k, v in prev.items()}
@@ -216,8 +217,9 @@ check("baseline (old protocol): plain sign-flip attackers are rejected", rej[0] 
 ag, step, rej, _ = run("dh", "sketchlie")
 check("gap 3, OLD protocol: benign sketch + poisoned upload passes screening and poisons the model",
       rej[0] == [] and step[0] < 0, f"(rejected {rej[0]}, model step along the signal {step[0]:+.2f})")
-ag, step, rej, chk = run("hardened", "sketchlie")
-check("gap 3, NEW protocol: the sum check fails and the round is discarded (model unchanged)",
+ag, step, rej, chk = run("hardened", "sketchlie", zk=False)
+check("gap 3, NEW protocol (Phase 1, without the Phase 5 proofs): the sum check fails and the round is "
+      "discarded (model unchanged)",
       chk[0] is False and abs(step[0]) < 1e-12 and ag.sum_check_failures == 1,
       f"(sum check {chk[0]}, step {step[0]:+.2e})")
 ag, step, rej, _ = run("dh", "nullspace")

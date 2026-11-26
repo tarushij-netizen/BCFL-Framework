@@ -8,7 +8,7 @@
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::{Identity, VartimeMultiscalarMul};
+use curve25519_dalek::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -83,6 +83,54 @@ fn from_uniform_bytes<'py>(py: Python<'py>, b: &[u8]) -> PyResult<Bound<'py, PyB
     Ok(out(py, RistrettoPoint::from_uniform_bytes(&a)))
 }
 
+/// sum_i s_i * P_i in constant time (for secret scalars, e.g. a Pedersen commitment to an update).
+#[pyfunction]
+fn multiscalar_mul_ct<'py>(py: Python<'py>, scalars: Vec<Vec<u8>>, points: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyBytes>> {
+    if scalars.len() != points.len() {
+        return Err(PyValueError::new_err("scalars and points differ in length"));
+    }
+    let ss = scalars.iter().map(|b| scalar(b)).collect::<PyResult<Vec<_>>>()?;
+    let ps = points.iter().map(|b| point(b)).collect::<PyResult<Vec<_>>>()?;
+    Ok(out(py, RistrettoPoint::multiscalar_mul(ss.iter(), ps.iter())))
+}
+
+/// A fixed list of points kept decompressed (the Pedersen generators), so a commitment to a
+/// long vector does not decompress thousands of points every time.
+#[pyclass]
+struct PointTable {
+    pts: Vec<RistrettoPoint>,
+}
+
+#[pymethods]
+impl PointTable {
+    #[new]
+    fn new(points: Vec<Vec<u8>>) -> PyResult<Self> {
+        Ok(PointTable { pts: points.iter().map(|b| point(b)).collect::<PyResult<Vec<_>>>()? })
+    }
+
+    fn __len__(&self) -> usize {
+        self.pts.len()
+    }
+
+    /// sum_i s_i * P_{idx_i}; constant time when ct is true (secret scalars).
+    fn msm<'py>(&self, py: Python<'py>, scalars: Vec<Vec<u8>>, idx: Vec<usize>, ct: bool) -> PyResult<Bound<'py, PyBytes>> {
+        if scalars.len() != idx.len() {
+            return Err(PyValueError::new_err("scalars and indices differ in length"));
+        }
+        let ss = scalars.iter().map(|b| scalar(b)).collect::<PyResult<Vec<_>>>()?;
+        let mut ps = Vec::with_capacity(idx.len());
+        for &i in &idx {
+            ps.push(*self.pts.get(i).ok_or_else(|| PyValueError::new_err("index out of range"))?);
+        }
+        let r = if ct {
+            RistrettoPoint::multiscalar_mul(ss.iter(), ps.iter())
+        } else {
+            RistrettoPoint::vartime_multiscalar_mul(ss.iter(), ps.iter())
+        };
+        Ok(out(py, r))
+    }
+}
+
 /// True if b is a canonical encoding of a group element.
 #[pyfunction]
 fn is_valid_point(b: &[u8]) -> bool {
@@ -96,6 +144,8 @@ fn bcfl_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(point_add, m)?)?;
     m.add_function(wrap_pyfunction!(point_sub, m)?)?;
     m.add_function(wrap_pyfunction!(multiscalar_mul, m)?)?;
+    m.add_function(wrap_pyfunction!(multiscalar_mul_ct, m)?)?;
+    m.add_class::<PointTable>()?;
     m.add_function(wrap_pyfunction!(identity, m)?)?;
     m.add_function(wrap_pyfunction!(from_uniform_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(is_valid_point, m)?)?;

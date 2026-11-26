@@ -13,17 +13,17 @@ also writes every post to ReputationLedger, which enforces the same phase rules 
 """
 
 OPEN_KINDS = {"upload_commit", "beacon_deal", "beacon_complaint", "beacon_open",
-              "secagg_deal", "secagg_complaint", "secagg_open"}
+              "secagg_deal", "secagg_complaint", "secagg_open", "zk_commit"}
 CLOSED_KINDS = {"beacon_reveal", "beacon_recon", "round_outcome", "secagg_reveal",
-                "verdict_attest", "round_accepted", "aggregate"}
+                "verdict_attest", "round_accepted", "aggregate", "zk_dispute", "zk_proof", "zk_liar"}
 
 # Phase 4: the server anchors a digest of these groups of posts (on chain with --onchain); every
 # reader compares the digest of its own view before acting on it.
 ANCHOR_PHASES = {
     "setup": ("secagg_deal", "secagg_complaint", "secagg_open", "beacon_deal", "beacon_complaint", "beacon_open"),
-    "uploads": ("upload_commit",),
-    "outcome": ("beacon_reveal", "beacon_recon", "verdict_attest", "round_accepted"),
-    "final": ("secagg_reveal", "aggregate", "round_outcome"),
+    "uploads": ("upload_commit", "zk_commit"),
+    "outcome": ("beacon_reveal", "beacon_recon", "verdict_attest", "round_accepted", "zk_dispute", "zk_proof"),
+    "final": ("secagg_reveal", "aggregate", "round_outcome", "zk_liar"),
 }
 
 

@@ -56,7 +56,7 @@ def _load_client_lib(root):
 class MPCScreening:
     def __init__(self, n, k, c, window, sim, mag, class_mad, coll_thr, group,
                  parties=5, root=None, port=None, party_port=None, binary="malicious-shamir-party.x",
-                 log_dir=None, observers=0):
+                 log_dir=None, observers=0, zk=False):
         """observers (Phase 4): number of committee observer clients that receive the same
         authenticated outputs as the coordinator (normally one per committee member)."""
         self.n, self.k, self.c, self.window = n, k, c, window
@@ -69,7 +69,10 @@ class MPCScreening:
         self.party_port = int(party_port or os.environ.get("BCFL_MPC_PARTY_PORT", 16000))
         self.binary = binary
         self.args = [str(n), str(k), str(c), str(window), repr(float(sim)), repr(float(mag)),
-                     repr(float(class_mad)), repr(float(coll_thr)), str(int(group)), str(int(observers))]
+                     repr(float(class_mad)), repr(float(coll_thr)), str(int(group)), str(int(observers)),
+                     str(int(bool(zk)))]
+        self.zk = bool(zk)
+        self.stage = None           # None | "begun" (waiting for pub2) | "decided" (waiting for the accepted set)
         self.observers = int(observers)
         self.last_observed = []     # what each observer received in the last decide / sum_accepted
         self.prog = "-".join(["bcfl_screen"] + self.args)
@@ -179,43 +182,80 @@ class MPCScreening:
             os_.Send(sock)
 
     # ----- one round
-    def decide(self, sketches_int, profiles_int, weights, judged, coll_active, present=None):
-        """sketches_int: n x k signed ints (24 fractional bits), profiles_int: n x c, weights: public
-        reputation weights (or None), judged: who has been around for the collusion window,
-        coll_active: whether the collusion check runs this round, present: clients taking part
-        this round (default all; Phase 3 leaves out clients that failed VSS). Returns three 0/1
-        lists; entries of absent clients are meaningless."""
-        t0 = time.perf_counter()
+    @property
+    def prime(self):
+        return int(self.coord.domain.modulus)
+
+    def begin(self, sketches_int, q_int, weights, present=None, mus=None):
+        """Inputs of one round. sketches_int: n x k signed ints (24 fractional bits); q_int: n x c
+        squared class-row norms (48 fractional bits); weights: public reputation weights (or None);
+        present: clients in this round's qualified set; mus: n x 2 masks (Phase 5, zk=True).
+        With zk, returns what the MPC drew and computed for the binding: {"coef": K+C ints,
+        "V1": [n], "V2": [n], "in_range": [n]} (V mod p), as the coordinator received it; each
+        observer's copy is in self.last_observed_zk."""
+        self._t0 = time.perf_counter()
         n = self.n
-        present = [True] * n if present is None else [bool(p) for p in present]
-        m = sum(present)
-        if m == 0:
+        self._present = [True] * n if present is None else [bool(p) for p in present]
+        if sum(self._present) == 0:
             raise ValueError("no client present")
-        lo, hi = (m - 1) // 2, m // 2
         w = [1.0] * n if weights is None else [max(float(x), 1e-12) for x in weights]
         winv = [int(round((1 << FRAC_BITS) / x)) for x in w]
-        self._send_public([1, int(coll_active), lo, hi] + [int(bool(j) and p) for j, p in zip(judged, present)]
-                          + winv + [int(p) for p in present])
+        self._send_public([1] + winv + [int(p) for p in self._present])
         for i in range(n):
-            if not present[i]:
+            if not self._present[i]:
                 continue
             vals = [int(x) for x in sketches_int[i]]
             if self.c:
-                vals += [int(x) for x in profiles_int[i]]
+                vals += [int(x) for x in q_int[i]]
+            if self.zk:
+                vals += [int(m) for m in mus[i]]
             self.clients[i].send_private_inputs(vals)
+        self.stage = "begun"
+        if not self.zk:
+            return None
+        cnt = self.k + self.c + 3 * n
+        p = self.prime
+
+        def parse(out):
+            coef = [int(v) % p for v in out[:self.k + self.c]]
+            rest = out[self.k + self.c:]
+            return {"coef": coef, "V1": [int(rest[3 * i]) % p for i in range(n)],
+                    "V2": [int(rest[3 * i + 1]) % p for i in range(n)],
+                    "in_range": [int(rest[3 * i + 2]) % p == 1 for i in range(n)]}
+        res = parse(self.coord.receive_outputs(cnt))
+        self.last_observed_zk = [parse(o.receive_outputs(cnt)) for o in self.obs]
+        return res
+
+    def finish(self, judged, coll_active, valid=None):
+        """Screening over the present clients whose proofs verified (valid). Returns three 0/1
+        lists (entries of clients not screened are meaningless)."""
+        n = self.n
+        valid = [True] * n if valid is None else [bool(v) for v in valid]
+        live = [p and v for p, v in zip(self._present, valid)]
+        m = max(sum(live), 1)
+        lo, hi = (m - 1) // 2, m // 2
+        self._send_public([int(coll_active), lo, hi] + [int(bool(j) and l) for j, l in zip(judged, live)]
+                          + [int(v) for v in valid])
         out = self.coord.receive_outputs(3 * n)
         self.last_observed = [o.receive_outputs(3 * n) for o in self.obs]
-        self._t0 = t0
+        self.stage = "decided"
         self.pending = True             # the program now waits for the accepted set
         return out[:n], out[n:2 * n], out[2 * n:]
 
+    def decide(self, sketches_int, q_int, weights, judged, coll_active, present=None, mus=None):
+        self.begin(sketches_int, q_int, weights, present, mus)
+        return self.finish(judged, coll_active)
+
     def finish_round(self):
-        """If a round was stopped after decide(), close it in the MPC (nothing accepted)."""
+        """If a round was stopped part way, close it in the MPC (nobody accepted)."""
+        if self.stage == "begun":
+            self.finish([False] * self.n, False, [False] * self.n)
         if getattr(self, "pending", False):
             self.sum_accepted([])
 
     def sum_accepted(self, accepted):
         self.pending = False
+        self.stage = None
         acc = set(accepted)
         self._send_public([1 if i in acc else 0 for i in range(self.n)])
         total = np.array(self.coord.receive_outputs(self.k), dtype=np.int64)
@@ -228,7 +268,7 @@ class MPCScreening:
     def stop(self):
         if self.coord is not None:
             try:
-                self._send_public([0] + [0] * (3 + 3 * self.n))
+                self._send_public([0] + [0] * (2 * self.n))
             except OSError:
                 pass
         for p in self.procs:

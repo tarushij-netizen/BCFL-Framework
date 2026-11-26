@@ -125,8 +125,9 @@ check("split accepted set, Phase 4 ON: the holders shown the other set refuse; n
       all(r["breach"] is False and r["alarms"] > 0 and r["sum"] is False for r in res), f"{res}")
 
 res, _ = rounds("drop_deal", False)
-check("hidden deal, Phase 4 OFF: clients disagree on who is in the round and the round is lost",
-      all(r["sum"] is False and r["alarms"] == 0 for r in res), f"{res}")
+check("hidden deal, Phase 4 OFF: clients disagree on who is in the round; the round is lost or (with the "
+      "Phase 5 pair check) the honest clients the deal was hidden from are wrongly thrown out",
+      all(r["alarms"] == 0 and (r["sum"] is False or set(r["rejected"]) - {0, 1, 2, 3}) for r in res), f"{res}")
 res, _ = rounds("drop_deal", True)
 check("hidden deal, Phase 4 ON: caught at the setup anchor, before anyone uploads",
       all(r["alarms"] > 0 and r["sum"] is False for r in res), f"{res}")

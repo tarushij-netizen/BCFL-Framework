@@ -125,6 +125,20 @@ off; `--server-attack split_accepted|drop_deal|forge_complaint|wrong_model|fake_
 malicious server colluding with the `--num-malicious` clients. `python test_phase4.py`,
 `./run_phase4.sh`.
 
+### C1 Phase 5: proofs that the screening inputs come from the upload
+With `--secagg hardened` each client commits to its update (Pedersen vector commitment) and to
+its pair masks at upload time, and proves in zero knowledge (`secure/zk.py`,
+`server/aggregation_alg/zkSecAgg.py`) that the sketch and the class input (squared class-row
+norms) it gives the screening are those of the committed update; with `--screening mpc` the MPC
+draws the coefficients after the inputs and outputs only masked binding values, so nothing extra
+is revealed. The commitment is tied to the masked upload by pair-mask commitments (checked
+pairwise, disputes settled with a DLEQ proof), the upload relation once the self-mask seed is
+revealed, and an audit against rejected clients' rebuilt keys. A client caught lying is named and
+kept out of the aggregate; the round goes on. `--no-zk` turns it off;
+`--c1-attack sketchlie|commitlie|pairlie` (with `--attack signflip`) are the lies.
+`python test_phase5.py`, `./run_phase5.sh`. The Rust extension gained a constant-time MSM and a
+generator table: rebuild it (`cd crypto/bcfl_crypto && env -u CONDA_PREFIX maturin develop --release`).
+
 ## Relative Article
 [1] [VeryFL Design] [VeryFL: A Verify Federated Learning Framework Embedded with Blockchain](http://106.52.19.28/resource/VeryFL.pdf)(Arxiv)
 

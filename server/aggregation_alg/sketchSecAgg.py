@@ -25,6 +25,14 @@ What this simulation does and does not do
   with Feldman VSS. A client whose shares do not match its public commitments (and who does not
   fix them when a holder complains) is left out of the round, and a holder that returns a wrong
   share at unmasking is caught and named. secagg_vss=False is the Phase 1 round (plain Shamir).
+- secagg_zk (default True, hardened + VSS; Phase 5, zkSecAgg.py): each client commits to its
+  update with its upload, proves in zero knowledge that the sketch and class input it gives the
+  screening come from that update, and binds the commitment to its masked upload; a client
+  caught lying is named and kept out of the aggregate, and the round goes on. The class profile
+  is then computed from the (proven) squared class-row norms. secagg_zk=False is Phase 4.
+- c1_attack "commitlie" / "pairlie" (need attack="signflip"): commit to and report a harmless
+  cover update but upload the poisoned one; "pairlie" also bends one pair-mask commitment so the
+  upload relation still holds.
 - server_checks (default True, hardened only; Phase 4, chainfl/relay.py): every post is signed,
   the server anchors a digest of what it relayed at four points of the round, and every client,
   holder and committee member checks its own view against the anchor before acting; holders
@@ -197,12 +205,13 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                  c1_attack="none", beacon_n=5, beacon_t=3, probation=0, collusion_check=False,
                  collusion_window=3, collusion_threshold=0.5, collusion_group=3, dump_screening=None,
                  screening="plain", secagg_vss=True, server_checks=True, server_attack="none",
-                 model=None, args=None):
+                 secagg_zk=True, model=None, args=None):
         ServerAggregator.__init__(self, model, args)
         if secagg not in ("sim", "dh", "hardened"):
             raise ValueError(f"secagg must be 'sim', 'dh' or 'hardened', got {secagg!r}")
-        if c1_attack not in ("none", "sketchlie", "nullspace", "badshare", "badreveal"):
-            raise ValueError(f"c1_attack must be none, sketchlie, nullspace, badshare or badreveal, got {c1_attack!r}")
+        if c1_attack not in ("none", "sketchlie", "nullspace", "badshare", "badreveal", "commitlie", "pairlie"):
+            raise ValueError(f"c1_attack must be none, sketchlie, nullspace, badshare, badreveal, commitlie or "
+                             f"pairlie, got {c1_attack!r}")
         if screening not in ("plain", "mpc", "mpc-check"):
             raise ValueError(f"screening must be 'plain', 'mpc' or 'mpc-check', got {screening!r}")
         if screening != "plain" and secagg != "hardened":
@@ -222,6 +231,14 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             raise ValueError("server_attack='fake_accept' needs --screening mpc (with plaintext screening the "
                              "server decides the verdicts itself)")
         self.server_checks = server_checks
+        self.secagg_zk = secagg_zk and secagg_vss
+        self.last_zk_rejected = []   # clients whose proof failed or who lied in a pair dispute (before screening)
+        self.last_zk_late = []       # clients caught after acceptance (upload relation / audit), removed
+        self.zk_rejections = 0
+        self.last_zk_seconds = 0.0
+        self._zk_invalid = set()
+        self._zk_hook = None
+        self._zk_holder_memo = {}
         self.server_attack = server_attack
         self.relay = None            # RelayBoard (Phase 4) around self.board
         self._ids = None             # {'client': {i: Identity}, 'member': {m: Identity}, 'server': Identity}
@@ -304,12 +321,14 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             for i in range(n):
                 self._ages[i] = self._ages.get(i, 0) + 1
         sims, ratios = [], []
-        if self.screening in ("plain", "mpc-check"):
-            screen_ok, class_ok, coll_flag, sims, ratios = self._checks_plain(sketches, profiles, n, absent)
         if self.screening in ("mpc", "mpc-check"):
             if sketch_ints is None:
                 raise ValueError("screening='mpc' needs --secagg hardened (integer sketches)")
             m = self._checks_mpc(sketch_ints, profiles, n, weights, absent)
+            absent = absent | self._zk_invalid           # Phase 5: proofs that did not verify
+        if self.screening in ("plain", "mpc-check"):
+            screen_ok, class_ok, coll_flag, sims, ratios = self._checks_plain(sketches, profiles, n, absent)
+        if self.screening in ("mpc", "mpc-check"):
             if self.screening == "mpc-check":
                 plain = (screen_ok, class_ok, coll_flag)
                 diff = [(name, i) for name, a, b in zip(("screen", "class", "collusion"), plain, m)
@@ -375,17 +394,21 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
 
     def _checks_mpc(self, sketch_ints, profiles, n, weights, absent=frozenset()):
         if self.mpc is None:
-            from mpc.screen_mpc import MPCScreening
             c = len(profiles[0]) if (self.class_check and profiles[0] is not None) else 0
-            self.mpc = MPCScreening(n, self.k, c, self.collusion_window if self.collusion_check else 0,
-                                    self.similarity_threshold, self.magnitude_ratio, self.class_mad,
-                                    self.collusion_threshold, self.collusion_group,
-                                    parties=self.beacon_n,
-                                    observers=len(self.beacon.members) if self.relay is not None else 0).start()
-        judged, active = self._collusion_public(n, absent) if self.collusion_check else ([False] * n, False)
-        prof_ints = [sf.encode_int(p) for p in profiles] if self.mpc.c else None
+            self._ensure_mpc(n, c)
+        q_ints = getattr(self, "_q_ints", None)
+        if self.mpc.c and q_ints is None:                # outside hardened rounds: profile as q-like ints
+            q_ints = [[int(v) for v in sf.encode_int(np.asarray(p) ** 2 * (1 << 24))] for p in profiles]
         present = [i not in absent for i in range(n)]
-        s_ok, c_ok, flag = self.mpc.decide(sketch_ints, prof_ints, weights, judged, active, present)
+        zr = getattr(self, "_zk_round", None)
+        mus = [zr.mpc_masks(i) if (zr is not None and present[i] and i in zr._sec) else [0, 0] for i in range(n)]
+        outs = self.mpc.begin(sketch_ints, q_ints, weights, present, mus if self.mpc.zk else None)
+        valid = None
+        if self.mpc.zk and self._zk_hook is not None:
+            valid = self._zk_hook(outs)
+            absent = set(absent) | self._zk_invalid
+        judged, active = self._collusion_public(n, absent) if self.collusion_check else ([False] * n, False)
+        s_ok, c_ok, flag = self.mpc.finish(judged, active, valid)
         self._verdict_bits = [int(x) for x in s_ok] + [int(x) for x in c_ok] + [int(x) for x in flag]
         return [bool(x) for x in s_ok], [bool(x) for x in c_ok], [bool(x) for x in flag]
 
@@ -447,7 +470,7 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         if not self._attacking(i):
             return u, u
         cover = -u / float(getattr(self, "attack_scale", 5.0))
-        if self.c1_attack == "sketchlie":
+        if self.c1_attack in ("sketchlie", "commitlie", "pairlie"):
             return u, cover
         h, s = guessed_hs        # nullspace: poison only where the expected sketch is blind
         x = cover + sf.null_space_project(u - cover, h.astype(np.int64), s, self.k)
@@ -525,6 +548,22 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                                         f"verdicts attested by {len(set(att))} committee members, need {t}")
             ok = {i for i in post.get("present", range(n))
                   if bits[i] and bits[n + i] and not bits[2 * n + i]}
+            zko = post.get("zk")
+            if zko is not None:                         # Phase 5: the binding outputs, attested
+                dz = hashlib.sha256(b"bcfl-zkout|" + canon([zko["coef"], zko["V1"], zko["V2"],
+                                                           zko["in_range"]])).digest()
+                attz = {m for a, (k, m), v in view.entries("verdict_attest", rnd) if k == "zk" and a == m and v == dz}
+                if len(attz) < t:
+                    raise EquivocationError(("client", j), rnd, "outcome",
+                                            f"ZK binding outputs attested by {len(attz)} members, need {t}")
+                zr = self._zk_round
+                for i in post["accepted"]:              # the holder checks each accepted proof itself
+                    key = (rnd, i)
+                    if key not in self._zk_holder_memo:  # (same public data for every holder: computed once here)
+                        self._zk_holder_memo[key] = zr.verify_mpc(i, zko, self.k, reader=("client", j))
+                    if not self._zk_holder_memo[key]:
+                        raise EquivocationError(("client", j), rnd, "outcome",
+                                                f"accepted client {i} has no valid proof")
             if not set(post["accepted"]) <= ok:
                 raise EquivocationError(("client", j), rnd, "outcome",
                                         f"accepted set has clients the screening rejected: "
@@ -702,6 +741,86 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         rows = np.linalg.norm(np.hstack([dw, db]), axis=1)
         return rows / (rows.sum() + 1e-12)
 
+    @staticmethod
+    def _zk_rows(keys, model, d):
+        """Index sets (in the flattened update) of the class rows of the last layer: the weights
+        w[c, :] and the bias b[c] of class c."""
+        from secure.zk import rows_layout
+        if len(keys) < 2:
+            return []
+        n_cls = _to_numpy(model[keys[-1]]).size
+        n_w = _to_numpy(model[keys[-2]]).size
+        return rows_layout(d, d - n_cls - n_w, n_cls, n_w // n_cls, d - n_cls)
+
+    @staticmethod
+    def _q_of(x_int, rows):
+        x = np.asarray(x_int, dtype=object)
+        return [int(sum(int(v) * int(v) for v in x[idx])) for idx in rows]
+
+    @staticmethod
+    def _profile_from_q(q):
+        r = np.sqrt(np.asarray(q, dtype=np.float64))
+        return r / (r.sum() + 1e-12)
+
+    def _ensure_mpc(self, n, c):
+        if self.mpc is None and self.screening in ("mpc", "mpc-check"):
+            from mpc.screen_mpc import MPCScreening
+            self.mpc = MPCScreening(n, self.k, c, self.collusion_window if self.collusion_check else 0,
+                                    self.similarity_threshold, self.magnitude_ratio, self.class_mad,
+                                    self.collusion_threshold, self.collusion_group,
+                                    parties=self.beacon_n,
+                                    observers=len(self.beacon.members) if self.relay is not None else 0,
+                                    zk=self.secagg_zk).start()
+
+    def _zk_mpc_hook(self, zr, outs, present, sketches, rnd):
+        """Between the MPC's inputs and its screening: committee members attest what the MPC
+        output for the binding, every present client posts its proof, and the proofs are checked.
+        Returns the valid bits for the MPC."""
+        from secure.signing import canon
+        n = self.mpc.n
+        self._zk_outs = {"coef": [int(c) for c in outs["coef"]], "V1": [int(v) for v in outs["V1"]],
+                         "V2": [int(v) for v in outs["V2"]], "in_range": [bool(b) for b in outs["in_range"]]}
+        if self.relay is not None:
+            for o, m in enumerate(self.beacon.members):
+                seen = self.mpc.last_observed_zk[o]
+                dig = hashlib.sha256(b"bcfl-zkout|" + canon([seen["coef"], seen["V1"], seen["V2"],
+                                                            [bool(b) for b in seen["in_range"]]])).digest()
+                self._member_post("verdict_attest", rnd, m, ("zk", m), dig)
+        valid = [False] * n
+        self._zk_verified = {}
+        for i in present:
+            zr.prove_mpc(i, sketches[i], outs)
+            ok = zr.verify_mpc(i, outs, self.k)
+            self._zk_verified[i] = ok
+            valid[i] = ok
+            if not ok:
+                zr.liars.setdefault(i, "proof does not verify")
+        self._zk_invalid = {i for i in present if not valid[i]}
+        return valid
+
+    def _zk_late_check(self, zr, frnd, uploads, accepted, qualified):
+        """After the b-shares are on the board: the upload relation of every accepted client and
+        the audit of its pair commitments with every rejected client."""
+        late = []
+        rejected = [j for j in qualified if j not in set(accepted)]
+        sk = {}
+        for j in rejected:
+            try:
+                sk[j] = frnd.rebuild("sk", j)
+            except RuntimeError:
+                pass
+        for i in accepted:
+            b_i = frnd.rebuild("b", i)
+            if not zr.relation_ok(i, uploads[i], b_i, qualified):
+                zr.liars.setdefault(i, "upload does not match the committed update")
+                late.append(i)
+                continue
+            bad = [j for j in sk if not zr.audit_ok(i, j, sk[j])]
+            if bad:
+                zr.liars.setdefault(i, f"pair commitment with rejected client {bad[0]} is wrong")
+                late.append(i)
+        return late
+
     def _abort_round(self, rnd, alarms, t0, why):
         """Phase 4: honest parties refused to go on; nothing from this round is used."""
         self.last_alarms = [str(a) for a in alarms]
@@ -726,6 +845,7 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         self._ensure_phase4(n)
         rnd = self.round
         self.last_alarms, self.last_privacy_breach = [], None
+        self._zk_outs, self._zk_round = None, None
         board = self.relay if self.relay is not None else self.board
         faults = self._share_faults(n)
         self._install_server_attack(rnd, n)
@@ -750,7 +870,21 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         absent = [i for i in range(n) if i not in qualified]
         self.last_vss_rejected = absent
         self.vss_rejections += len(absent)
-        uploads, x_ints, cover_ints = {}, {}, {}
+        rows = self._zk_rows(keys, models[0], d) if (self.class_check or self.secagg_zk) else []
+        n_cls = len(rows) if self.class_check else 0
+        self._ensure_mpc(n, n_cls)
+        zr = None
+        self.last_zk_rejected, self.last_zk_late, self._zk_invalid, self._zk_hook = [], [], set(), None
+        if self.secagg_zk:                              # Phase 5
+            from .zkSecAgg import ZKRound
+            zf = {}
+            if self.c1_attack == "pairlie":
+                honest_q = [j for j in qualified if j not in set(getattr(self, "malicious", []))]
+                zf["pair_lie"] = {(i, honest_q[0]) for i in qualified if self._attacking(i) and honest_q}
+            zr = ZKRound(n, d, rows, board, rnd, frnd, self._ids["client"] if self._ids else None,
+                         self.mpc.prime if self.mpc is not None else None, zf)
+        uploads, x_ints, cover_ints, zdig = {}, {}, {}, {}
+        lying = set()
         for i in qualified:                             # client side, before any seed exists
             u_true = _flatten(models[i], keys) - ref
             u, u_sk = self._adversary(i, u_true, guessed_hs)
@@ -758,11 +892,17 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             x_ints[i] = sf.encode_int(w * u)
             cover_ints[i] = sf.encode_int(w * u_sk)
             uploads[i] = frnd.client_upload_int(i, x_ints[i])
+            if self._attacking(i) and self.c1_attack in ("sketchlie", "commitlie", "pairlie"):
+                lying.add(i)
+            if zr is not None:                          # commit to the update (a liar: to its cover)
+                committed = cover_ints[i] if (i in lying and self.c1_attack in ("commitlie", "pairlie")) else x_ints[i]
+                zdig[i] = zr.commit(i, committed, x_ints[i], qualified)
 
         def commitment(i):
             if i not in uploads:                        # left out by VSS: nothing uploaded
                 return hashlib.sha256(b"bcfl-absent|" + int(rnd).to_bytes(8, "big") + int(i).to_bytes(4, "big")).digest()
-            return frnd.upload_hash(i, uploads[i]) if self.secagg_vss else sf.upload_hash(rnd, i, uploads[i])
+            base = frnd.upload_hash(i, uploads[i]) if self.secagg_vss else sf.upload_hash(rnd, i, uploads[i])
+            return hashlib.sha256(base + zdig[i]).digest() if i in zdig else base
         hashes = [commitment(i) for i in range(n)]
         sigs = None
         if self._ids is not None:                       # Phase 4: each client signs its own commitment
@@ -778,13 +918,38 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                 return self._abort_round(rnd, [a for _, a in alarms], t0, f"committee refused to reveal ({e})")
             raise
         h, s = sf.sketch_params_from_seed(seed, d, self.k)
-        sketches = []
-        for i in range(n):                              # client side: report a sketch
+        sketches, q_ints = [], []
+        for i in range(n):                              # client side: report a sketch (+ class input)
             if i not in uploads:
                 sketches.append(np.zeros(self.k, dtype=np.int64))
+                q_ints.append([0] * len(rows))
                 continue
             honest = self.c1_attack == "nullspace" or not self._attacking(i)
-            sketches.append(sf.sketch_int(x_ints[i] if honest else cover_ints[i], h, s, self.k))
+            rep = x_ints[i] if honest else cover_ints[i]
+            sketches.append(sf.sketch_int(rep, h, s, self.k))
+            q_ints.append(self._q_of(rep, rows) if self.class_check else [])
+        self._q_ints = q_ints
+        profiles = [self._profile_from_q(q) if i in uploads else np.full(len(rows), 1.0 / len(rows))
+                    for i, q in enumerate(q_ints)] if self.class_check else profiles
+        zk_out = set()
+        if zr is not None:                              # Phase 5: before screening
+            tz = time.perf_counter()
+            zr.set_round_params(seed, (h, s))
+            for i in zr.pair_check(qualified):
+                zk_out.add(i)
+            present = [i for i in qualified if i not in zk_out]
+            if self.mpc is None:                        # plaintext screening: proofs checked now
+                for i in present:
+                    zr.prove_plain(i, sketches[i], (h, s))
+                    sec = zr._sec[i]                    # the client hands q and its openings to the server
+                    if not zr.verify_plain(i, sketches[i], q_ints[i], sec["r_q"]):
+                        zk_out.add(i)
+                        zr.liars.setdefault(i, "proof does not verify")
+            else:                                       # MPC: proofs checked between input and screening
+                self._zk_hook = lambda outs, zr=zr, present=present, sk=sketches: self._zk_mpc_hook(
+                    zr, outs, present, sk, rnd)
+            self.last_zk_seconds = time.perf_counter() - tz
+        self._zk_round = zr
         # server side: check uploads against the board, screen, unmask, check the sum
         posted = board.upload_commitments(rnd)
         for i in qualified:
@@ -793,7 +958,11 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
         wts = [1.0] * n if weights is None else [max(w, 1e-12) for w in weights]
         float_sketches = [sf.decode_int(sketches[i]) / wts[i] for i in range(n)]
         self._verdict_bits = None
-        accepted, sims, ratios = self._decide(float_sketches, profiles, n, sketches, weights, absent=set(absent))
+        accepted, sims, ratios = self._decide(float_sketches, profiles, n, sketches, weights,
+                                              absent=set(absent) | zk_out)
+        if zr is not None:
+            self.last_zk_rejected = sorted(zk_out | self._zk_invalid)
+            self.zk_rejections += len(self.last_zk_rejected)
         self.last_update_hashes = hashes
         self.last_sum_check = None
         self.last_bad_reveals = []
@@ -803,6 +972,8 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
             bits = self._verdict_bits
             post = {"accepted": sorted(accepted), "present": sorted(qualified),
                     "verdicts": None if bits is None else [int(b) for b in bits]}
+            if getattr(self, "_zk_outs", None) is not None:
+                post["zk"] = self._zk_outs
             if bits is not None:                        # committee members attest what they received
                 for o, m in enumerate(self.beacon.members):
                     seen = [int(x) for x in self.mpc.last_observed[o]]
@@ -845,7 +1016,21 @@ class sketchSecAggAggregator(_PoolMixin, ServerAggregator):
                                   f"of client {victim} and recovered its individual update")
                     if frnd.alarms and self.server_checks:
                         return self._abort_round(rnd, frnd.alarms, t0, "holders refused to reveal")
-                    sum_int = frnd.server_unmask_sum_int(uploads, accepted)
+                    late = self._zk_late_check(zr, frnd, uploads, accepted, qualified) if zr is not None else []
+                    if late:                            # Phase 5: proven liars leave the aggregate
+                        self._server_post("zk_liar", rnd, "liars", {"liars": late,
+                                          "why": {str(i): zr.liars.get(i, "") for i in late}}) \
+                            if self._ids is not None else None
+                        verdict = {i: True for i in late}
+                        frnd.holders_reveal_liars(late, check=lambda j, i, v=verdict: v.get(i, False))
+                        accepted = [i for i in accepted if i not in late]
+                        self.last_zk_late = late
+                        self.zk_rejections += len(late)
+                        print(f"[sketchSecAgg] round {rnd}: clients {late} were accepted but their upload does "
+                              f"not match what they proved ({[zr.liars[i] for i in late]}); removed from the aggregate")
+                    if not accepted:
+                        raise RuntimeError("no client left after removing proven liars")
+                    sum_int = frnd.server_unmask_sum_int(uploads, accepted, liars=late)
                     self.last_bad_reveals = sorted(frnd.bad_reveals)
                 else:
                     sum_int = frnd.server_unmask_sum_int(uploads, accepted)

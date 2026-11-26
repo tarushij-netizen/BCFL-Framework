@@ -27,7 +27,18 @@
 # member, so the members see the verdicts and the total themselves and can attest them on the
 # board; the server cannot report different ones.
 #
-# Compile:  ./compile.py -F 128 bcfl_screen N K C W SIM MAG CMAD CTHR GROUP OBS
+# Phase 5: the class input is q[c] = sum of squares of the class row c of the update (48
+# fractional bits); the profile q -> sqrt(q) / sum sqrt(q) is computed here. With ZK=1 each client
+# also inputs two masks mu1, mu2; after the inputs the MPC draws random 40-bit coefficients
+# c (K + C of them), and outputs V1 = <c[:K], sketch> + mu1 and V2 = <c[K:], q> + mu2 (mod p) and
+# whether the inputs are in range. Each client then proves in zero knowledge (secure/zk.py) that
+# the same relations hold for the update it committed to; the coordinator reports which proofs
+# verify (valid) and only those clients are screened.
+#
+# Public inputs per round:  pub1 = [continue, winv[N], present[N]]  (before the inputs)
+#                           pub2 = [coll_active, lo, hi, judged[N], valid[N]]  (after them)
+#
+# Compile:  ./compile.py -F 128 bcfl_screen N K C W SIM MAG CMAD CTHR GROUP OBS ZK
 #   C = 0 disables the class check, W = 0 disables the collusion check.
 
 from Compiler import mpc_math
@@ -36,6 +47,8 @@ args = program.args[1:]
 N, K, C, W = int(args[0]), int(args[1]), int(args[2]), int(args[3])
 SIM, MAG, CMAD, CTHR, GROUP = float(args[4]), float(args[5]), float(args[6]), float(args[7]), int(args[8])
 OBS = int(args[9]) if len(args) > 9 else 0
+ZK = int(args[10]) if len(args) > 10 else 0
+NIN = K + C + (2 if ZK else 0)
 F = 24
 sfix.set_precision(F, 56)
 cfix.set_precision(F, 56)
@@ -113,41 +126,77 @@ coll_hist = sfix.Matrix(max(W, 1), N * N)
 rounds_done = MemValue(regint(0))
 raw = sint.Matrix(N, K)
 prof = sint.Matrix(N, max(C, 1))
+mus = sint.Matrix(N, 2)
 BIG = cfix(2 ** 20)          # above any sketch coordinate, norm or profile distance
 
 
 @do_while
 def _round():
-    pub = regint.read_from_socket(regint(COORD), 4 + 3 * N)
+    pub = regint.read_from_socket(regint(COORD), 1 + 2 * N)
     cont = pub[0]
 
     @if_(cont)
     def _():
-        coll_active = pub[1]
-        lo, hi = pub[2], pub[3]
-        judged = [pub[4 + i] for i in range(N)]
-        winv = [cfix._new(cint(pub[4 + N + i])) for i in range(N)]
-        present = [pub[4 + 2 * N + i] for i in range(N)]
-        pres = [cint(p) for p in present]
-        absent_big = [(1 - p) * BIG for p in pres]
+        winv = [cfix._new(cint(pub[1 + i])) for i in range(N)]
+        present = [pub[1 + N + i] for i in range(N)]
+        coord = regint.Array(1 + OBS)           # coordinator, then the committee's observers
+        for o in range(1 + OBS):
+            coord[o] = COORD + o
 
         # clients outside this round's qualified set (Phase 3: failed VSS) send nothing
         for i in range(N):
             @if_e(present[i])
             def _():
-                x = sint.receive_from_client(K + C, regint(i))
+                x = sint.receive_from_client(NIN, regint(i))
                 raw[i].assign_vector(sint.concat(x[:K]))
                 if C:
-                    prof[i].assign_vector(sint.concat(x[K:]))
+                    prof[i].assign_vector(sint.concat(x[K:K + C]))
+                if ZK:
+                    mus[i].assign_vector(sint.concat(x[K + C:K + C + 2]))
 
             @else_
             def _():
                 raw[i].assign_all(0)
                 if C:
                     prof[i].assign_all(0)
+                if ZK:
+                    mus[i].assign_all(0)
 
-        V = [sfix._new(raw[i].get_vector()) * winv[i] for i in range(N)]
-        P = [sfix._new(prof[i].get_vector()) for i in range(N)] if C else []
+        if ZK:
+            # inputs are fixed: now draw the coefficients, so no client could have chosen its
+            # inputs (or masks) knowing them
+            coef = [sint.get_random_int(40) for _ in range(K + C)]
+            cc = [c_.reveal() for c_ in coef]
+            outz = list(coef)
+            for i in range(N):
+                s_ = raw[i].get_vector()
+                v1 = sum(cc[t] * s_[t] for t in range(K)) + mus[i][0]
+                v2 = mus[i][1]
+                if C:
+                    q_ = prof[i].get_vector()
+                    v2 = sum(cc[K + c_] * q_[c_] for c_ in range(C)) + mus[i][1]
+                ok = ((s_ < 2 ** 45) * (s_ > -(2 ** 45))).sum() == K
+                if C:
+                    ok = ok * (((q_ >= 0) * (q_ < 2 ** 58)).sum() == C)
+                outz += [v1, v2, ok]
+            sint.reveal_to_clients(coord, outz)
+
+        pub2 = regint.read_from_socket(regint(COORD), 3 + 2 * N)
+        coll_active = pub2[0]
+        lo, hi = pub2[1], pub2[2]
+        judged = [pub2[3 + i] for i in range(N)]
+        present = [present[i] * pub2[3 + N + i] for i in range(N)]     # Phase 5: proof verified
+        pres = [cint(p) for p in present]
+        absent_big = [(1 - p) * BIG for p in pres]
+
+        V = [sfix._new(raw[i].get_vector()) * winv[i] * pres[i] for i in range(N)]
+        P = []
+        for i in range(N):
+            if not C:
+                break
+            q24 = prof[i].get_vector().round(64, 24, nearest=True, signed=False)   # 48 -> 24 frac bits
+            rows = mpc_math.sqrt(sfix._new(q24))
+            P.append(rows * (1 / (rows.sum() + cfix(EPS))) * pres[i])
 
         # ---- screening: cosine to the coordinate-wise median + norm ratio
         m = median([V[i] + absent_big[i] for i in range(N)], lo, hi)
@@ -202,9 +251,6 @@ def _round():
             out[i] = screen_ok[i]
             out[N + i] = class_ok[i]
             out[2 * N + i] = coll_flag[i]
-        coord = regint.Array(1 + OBS)           # coordinator, then the committee's observers
-        for o in range(1 + OBS):
-            coord[o] = COORD + o
         sint.reveal_to_clients(coord, list(out))
 
         # ---- sum of the accepted raw sketches, for the sum check

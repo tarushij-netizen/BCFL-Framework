@@ -131,9 +131,10 @@ def qualified_clients(board, rnd, n, t):
     return qual
 
 
-def valid_reveals(board, rnd, deals, kind, client):
+def valid_reveals(board, rnd, deals, kind, client, allow_both=False):
     """{x: y} of verified shares of `kind` ('sk' or 'b') of `client`, one per holder, from holders
-    that did not also reveal the other kind for that client; and the holders whose share was wrong."""
+    that did not also reveal the other kind for that client (unless allow_both: a proven liar,
+    Phase 5); and the holders whose share was wrong."""
     posts = board.entries("secagg_reveal", rnd)
     kinds_by_holder = {}
     for author, (j, k, i), _ in posts:
@@ -145,7 +146,7 @@ def valid_reveals(board, rnd, deals, kind, client):
     for author, (j, k, i), y in posts:
         if author != j or i != client or k != kind or (j + 1) in good or j in bad:
             continue
-        if len(kinds_by_holder.get(j, ())) > 1:
+        if len(kinds_by_holder.get(j, ())) > 1 and not allow_both:
             bad.append(j)                       # revealed both kinds: refused
             continue
         if vss.verify(j + 1, y, C):
@@ -348,8 +349,34 @@ class VSSSecAggRound:
                         other = sh[1] if kind == "sk" else sh[0]
                         self._post("secagg_reveal", j, (j, "b" if kind == "sk" else "sk", i), other)
 
-    def server_unmask_sum_int(self, uploads, accepted):
-        """Unmask sum_{i in accepted} enc(x_i) from the uploads and the board's revealed shares."""
+    def rebuild(self, kind, i, allow_both=False):
+        """Rebuild client i's secret ('b' or 'sk') from the verified shares on the board (anyone can)."""
+        deals = deals_on_board(self.board, self.rnd)
+        good, bad = valid_reveals(self.board, self.rnd, deals, kind, i, allow_both)
+        for j in bad:
+            self.bad_reveals.setdefault(j, []).append((kind, i))
+        if len(good) < self.t:
+            raise RuntimeError(f"round {self.rnd}: only {len(good)} valid {kind}-shares of client {i}, "
+                               f"need {self.t}")
+        return vss.reconstruct(dict(list(good.items())[:self.t]))
+
+    def holders_reveal_liars(self, liars, check=None, holders=None):
+        """Phase 5: a client proven to have lied after it was accepted is taken out of the
+        aggregate: each holder that confirms the proof itself (check(j, i)) also reveals its
+        sk-share of that client."""
+        holders = range(self.n) if holders is None else holders
+        for j in holders:
+            for i in liars:
+                if i == j or (check is not None and not check(j, i)):
+                    continue
+                sh = self.holder_share(j, i)
+                if sh is not None:
+                    self._post("secagg_reveal", j, (j, "sk", i), sh[0])
+
+    def server_unmask_sum_int(self, uploads, accepted, liars=()):
+        """Unmask sum_{i in accepted} enc(x_i) from the uploads and the board's revealed shares.
+        liars: clients removed after acceptance (Phase 5); both of their secrets may be on the board."""
+        liars = set(liars)
         acc = sorted(set(accepted))
         if not set(acc) <= set(self.qualified):
             raise ValueError("accepted clients must be qualified")
@@ -358,7 +385,7 @@ class VSSSecAggRound:
         self.bad_reveals = {}
 
         def rebuild(kind, i):
-            good, bad = valid_reveals(self.board, self.rnd, deals, kind, i)
+            good, bad = valid_reveals(self.board, self.rnd, deals, kind, i, allow_both=i in liars)
             for j in bad:
                 self.bad_reveals.setdefault(j, []).append((kind, i))
             if len(good) < self.t:

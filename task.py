@@ -212,7 +212,7 @@ class Task:
                              'attack_on', 'malicious_included', 'rej_screen', 'rej_class',
                              'rej_collusion', 'rej_reputation', 'collusion_max_cos', 'rej_vss',
                              'bad_reveal_holders', 'round_discarded', 'server_alarms', 'privacy_breach',
-                             'model_alarms'])
+                             'model_alarms', 'rej_zk', 'zk_late_removed'])
         client_test = self.global_args.get('client_test', True)
 
         for i in range(self.global_args['communication_round']):
@@ -289,7 +289,9 @@ class Task:
                                    len(getattr(self.server, 'last_alarms', []) or []),
                                    '' if getattr(self.server, 'last_privacy_breach', None) is None
                                    else int(self.server.last_privacy_breach),
-                                   ' '.join(map(str, getattr(self.server, 'last_model_alarms', []) or []))])
+                                   ' '.join(map(str, getattr(self.server, 'last_model_alarms', []) or []))]
+                                + [' '.join(map(str, getattr(self.server, a, []) or [])) for a in
+                                   ('last_zk_rejected', 'last_zk_late')])
                 f.flush()
         if writer:
             f.close()

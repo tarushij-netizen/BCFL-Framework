@@ -36,7 +36,7 @@ class EquivocationError(RuntimeError):
         self.reader, self.rnd, self.phase, self.why = reader, rnd, phase, why
 
 
-SERVER_KINDS = {"round_accepted", "aggregate", "round_outcome"}
+SERVER_KINDS = {"round_accepted", "aggregate", "round_outcome", "zk_liar"}
 MEMBER_KINDS = {"beacon_deal", "beacon_complaint", "beacon_open", "beacon_reveal", "beacon_recon", "verdict_attest"}
 
 
@@ -59,9 +59,23 @@ class Registry:
         return self.keys[role].get(author)
 
 
+_CANON_CACHE = {}
+
+
+def _canon_post(kind, rnd, a, k, v, sg):
+    """canon() of a post, cached per post object (posts are never changed after posting)."""
+    key = (kind, rnd, sg, id(v), id(k))
+    hit = _CANON_CACHE.get(key)
+    if hit is not None and hit[0] is v and hit[1] is k:
+        return hit[2]
+    out = canon([kind, int(rnd), a, k, v, sg])
+    _CANON_CACHE[key] = (v, k, out)
+    return out
+
+
 def entries_digest(signed, rnd, kinds):
     """Order-free digest of a set of signed posts."""
-    items = sorted(canon([kind, int(rnd), a, k, v, sg]) for kind in kinds for a, k, v, sg in signed(kind, rnd))
+    items = sorted(_canon_post(kind, rnd, a, k, v, sg) for kind in kinds for a, k, v, sg in signed(kind, rnd))
     h = hashlib.sha256(b"bcfl-anchor|" + int(rnd).to_bytes(8, "big"))
     for it in items:
         h.update(len(it).to_bytes(4, "big") + it)
@@ -75,6 +89,7 @@ class RelayBoard:
         self._hide = {}                         # reader -> [predicate(kind, rnd, author, key, value)]
         self._only = {}                         # (reader, kind, rnd) -> index of the one version shown
         self._inject = {}                       # reader -> [(kind, rnd, author, key, value, sig)]
+        self._vcache = {}
 
     # ----- writing (goes to the real board)
     def post(self, kind, rnd, author, key, value, sig=None):
@@ -122,6 +137,18 @@ class RelayBoard:
     def view(self, reader):
         return BoardView(self, reader)
 
+    def _verified(self, kind, rnd, post):
+        """Signature check of one post, cached per post object (a reader re-reads the same posts
+        many times in one round; the answer cannot change)."""
+        a, k, v, sg = post
+        key = (kind, rnd, sg, id(v), id(k), repr(a))
+        hit = self._vcache.get(key)
+        if hit is not None and hit[0] is v and hit[1] is k:
+            return hit[2]
+        ok = verify_post(self.registry.pk(kind, a), kind, rnd, a, k, v, sg)
+        self._vcache[key] = (v, k, ok)
+        return ok
+
 
 class BoardView:
     """What one reader sees: the relayed posts minus anything hidden from it, plus anything
@@ -141,7 +168,7 @@ class BoardView:
             posts += [(a, k, v, sg) for kd, r_, a, k, v, sg in self.r._inject.get(self.reader, [])
                       if kd == kind and r_ == rnd]
         if self.r.verify:
-            posts = [p for p in posts if verify_post(self.r.registry.pk(kind, p[0]), kind, rnd, *p)]
+            posts = [p for p in posts if self.r._verified(kind, rnd, p)]
         return posts
 
     def entries(self, kind, rnd):

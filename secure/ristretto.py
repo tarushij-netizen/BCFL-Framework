@@ -52,8 +52,23 @@ def sub(p: bytes, q: bytes) -> bytes:
 
 
 def msm(scalars, points) -> bytes:
-    """sum_i scalars[i] * points[i]."""
+    """sum_i scalars[i] * points[i] (variable time: for public scalars, e.g. verification)."""
     return _rc.multiscalar_mul([scalar_bytes(s) for s in scalars], list(points))
+
+
+def msm_ct(scalars, points) -> bytes:
+    """sum_i scalars[i] * points[i] in constant time (secret scalars)."""
+    return _rc.multiscalar_mul_ct([scalar_bytes(s) for s in scalars], list(points))
+
+
+class PointTable:
+    """Points kept decompressed on the Rust side (Pedersen generators)."""
+
+    def __init__(self, points):
+        self._t = _rc.PointTable(list(points))
+
+    def msm(self, scalars, idx, ct):
+        return self._t.msm([scalar_bytes(s) for s in scalars], list(idx), bool(ct))
 
 
 def identity() -> bytes:
