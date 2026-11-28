@@ -1,0 +1,2 @@
+honest_reward_share,attacker_reward_share,attacker_reward_eth,attacker_stake_eth,attacker_new_identities,sybil_accounts,sybil_reward_share,epochs,committee_tally_mismatches,final_acc,final_asr,max_asr_from_round3,attack_rounds,attacker_uploads_included_while_attacking,attacker_uploads_while_attacking,whitewash_rejoins
+1.0,0.0,0.0,0.0,0,0,0.0,1,0,59.83,,,0,0,0,0

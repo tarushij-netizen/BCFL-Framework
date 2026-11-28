@@ -1,0 +1,12 @@
+operation,calls,mean_gas,max_gas
+deploy,1,2220311,2220311
+register (per account),10,123736,139126
+beacon postDeal,25,61111,61131
+postAnchor,20,50254,50806
+recordRound (10 clients),5,285589,285611
+beacon postReveal,25,52877,52883
+postOutcome,5,27535,27538
+postVerdicts (10 clients),5,289362,289414
+proposeEpoch,1,105089,105089
+approveEpoch,2,115646,164742
+distribute,1,308753,308753

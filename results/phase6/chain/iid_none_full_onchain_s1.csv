@@ -1,0 +1,6 @@
+round,global_acc,global_loss,rejected,malicious_caught,honest_rejected,backdoor_asr,attack_on,malicious_included,rej_screen,rej_class,rej_collusion,rej_reputation,collusion_max_cos,rej_vss,bad_reveal_holders,round_discarded,server_alarms,privacy_breach,model_alarms,rej_zk,zk_late_removed
+0,19.0300,2.264337,,0,0,,0,0,,,,,0.0,,,0,0,,,,
+1,41.6600,1.672087,,0,0,,0,0,,,,,0.0,,,0,0,,,,
+2,53.9400,1.304629,0 9,0,2,,0,0,,0 9,,,0.197,,,0,0,,,,
+3,59.4500,1.159186,,0,0,,0,0,,,,,0.157,,,0,0,,,,
+4,59.8300,1.110026,,0,0,,0,0,,,,,0.158,,,0,0,,,,
